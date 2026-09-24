@@ -13,9 +13,8 @@ parse as `198.51.100.1:80/tcp`, and `parse_ipv4` (sscanf `%u`) accepts
 instead of rejected.
 
 Found by probing the parser while writing `tests/core/vipspec_test.cpp`.
-Status: open. Fix belongs in vipspec.h (require the port substring to be 1-5
-ASCII digits, and each octet to be 1-3 digits), then add these strings to
-`VipSpec.RejectsBadInput`.
+Status: fixed. vipspec.h is now strict: four decimal octets of digits only, and
+a port of ASCII digits only in 1..65535.
 
 ## hash.h comment says it is the kernel's jhash_3words; it is not
 
@@ -29,5 +28,6 @@ Harmless for correctness, because the XDP program and the control plane both
 include hash.h and never call the kernel's jhash, and
 `tests/core/hash_test.cpp` pins the current values. But anyone who swaps in the
 kernel function "because the comment says it is the same" would break lb1/lb2
-agreement. Status: open, fix is to correct the comment (not the function, which
+agreement. Status: fixed. The comment now says the function is not
+bit-identical to the kernel's (the function is unchanged, since changing it
 would re-shuffle every ring).
