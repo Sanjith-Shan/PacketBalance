@@ -175,7 +175,15 @@ python3 lab/render_tables.py --write
 
 `lab/experiments.sh` writes one JSON row per run to `results/`, and `render_tables.py`
 fills the tables above from those rows. `sudo lab/down.sh` removes everything the lab
-created.
+created. `ctest` needs root for the data-plane suite, which loads the XDP program and
+pushes crafted frames through it with `BPF_PROG_TEST_RUN` (no interface, no namespaces),
+and for the daemon suite.
+
+The same thing runs in CI on every push: the `linux-full` job builds and runs every test
+on a stock x86-64 GitHub runner, and the `e2e` job brings up the namespaced lab there,
+attaches the XDP program, and curls the VIP through PacketBalance and through IPVS. A
+fresh x86-64 cloud VM reproduces the full experiment suite with `lab/cloud-run.sh`, see
+[docs/DEVELOPING.md](docs/DEVELOPING.md).
 
 ## Layout
 
