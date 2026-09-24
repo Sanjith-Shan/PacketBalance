@@ -217,8 +217,9 @@ and with conntrack off are `147 kpps`, `109 kpps`,
 `114 kpps` and `173 kpps`. The direction is
 consistent with Katran's observation (the table costs measurable rate), but the repeats
 spread 30 to 40% at the large sizes and the 1M row disagrees with Experiment 1's identical
-configuration, so the sizes are not ranked against each other here. Generic mode is not
-included.
+configuration, so the sizes are not ranked against each other here. In generic mode the
+table size made no visible difference (1.07 to 1.26 Mpps received at every setting),
+because the skb allocation dominates that path.
 
 The rings are small by comparison. Each VIP's ring is 65,537 × 4 bytes = 256 KiB, so 64
 VIPs are 16 MiB.

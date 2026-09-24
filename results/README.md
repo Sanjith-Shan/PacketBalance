@@ -120,11 +120,12 @@ pb_tx                        the program's tx counter (XDP_TX verdicts)
  + unaccounted                timing skew between the stats and netdev snapshots, frames in flight
 ```
 
-A 30 s native window at saturation (4 pktgen threads, 10,000 flows), from
-`exp1_mitigations.jsonl` / `exp1_pps.jsonl`: the client offered about 150 M frames,
-108 M were dropped before the program because lb1's veth receive ring was full,
-the program forwarded about 42 M (its `tx`), 23 M of those were lost handing
-them to pb-lb1 (`xdp_tx_errors`), and 19 M arrived at the reals. The loss is
+A 30 s native window at saturation (4 pktgen threads, 10,000 flows), from the two
+`standard` rows of `exp1_mitigations.jsonl` (the `exp1_pps.jsonl` rows predate the
+full accounting): the client offered about 141 M frames, about 100 M were dropped before
+the program because lb1's veth receive ring was full, the program forwarded about 40.5 M
+(its `tx`), about 21 M of those were lost handing them to pb-lb1 (`xdp_tx_errors`), and
+about 19.5 M arrived at the reals; under 0.1% of offered is unaccounted for. The loss is
 in the veth driver on either side of the program, not in the program: its own
 drop counters are 0 and the conntrack hit rate is above 99.9%.
 

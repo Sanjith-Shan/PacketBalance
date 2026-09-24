@@ -351,8 +351,10 @@ and at 64K, 1M and 8M entries. Received rates: off 719 kpps, 64K 610 kpps, 1M 45
 rate, consistent with Katran's observation that hashing can be cheaper than the lookup.
 The sizes are not trustworthy: the large-table repeats spread 30 to 40%, and the 1M row
 (453 kpps) disagrees with Experiment 1's identical configuration (582 kpps) because these
-windows were host-contended. Generic mode is not part of this result: its rows were still
-being measured when this was written, and any in the table are not yet interpreted.
+windows were host-contended. In generic mode the table made no difference that stands out
+from the spread: received rates stayed between 1.07 and 1.26 Mpps at every setting (off,
+64K, 1M, 8M), with no XDP_TX errors, because generic mode's cost is dominated by the skb
+allocation that native mode avoids, so a hash lookup more or less does not show.
 
 <!-- results:exp6 -->
 Experiment 1's load through PacketBalance with the connection table off and at three sizes. Host: Apple M3 Pro via Lima vz (6 vCPU, 8 GiB), 6 CPUs, kernel 6.8.0-139-generic, aarch64. Dates: 2026-09-24 to 2026-09-24. Generator: pktgen.
@@ -363,14 +365,15 @@ Experiment 1's load through PacketBalance with the connection table off and at t
 | native | 65,536 flows (--conntrack-size) | 3 | 1.26 M (1.04 M-1.59 M) | 610 k (580 k-649 k) | 69.1 (68.2-70.8) | 147 k (136 k-159 k) | 0 (0-0) / 663 k (465 k-951 k) |  |
 | native | 1,048,576 flows (--conntrack-size) | 3 | 894 k (669 k-1.11 M) | 453 k (390 k-524 k) | 69.2 (68.0-71.3) | 109 k (95 k-128 k) | 0 (0-0) / 448 k (231 k-589 k) |  |
 | native | 8,388,608 flows (--conntrack-size) | 3 | 1.09 M (869 k-1.36 M) | 465 k (365 k-541 k) | 68.1 (67.9-68.3) | 114 k (90 k-133 k) | 0 (0-0) / 635 k (513 k-847 k) |  |
-| generic | off | 1 | 1.29 M | 911 k | 65.2 | 233 k | 0 / 0 |  |
-| generic | 65,536 flows (--conntrack-size) | 1 | 1.26 M | 970 k | 66.9 | 242 k | 0 / 0 |  |
+| generic | off | 3 | 1.52 M (1.29 M-1.76 M) | 1.07 M (911 k-1.25 M) | 66.5 (65.2-67.9) | 267 k (233 k-306 k) | 0 (0-0) / 0 (0-0) |  |
+| generic | 65,536 flows (--conntrack-size) | 3 | 1.51 M (1.26 M-1.69 M) | 1.13 M (970 k-1.22 M) | 67.9 (66.9-68.4) | 276 k (242 k-298 k) | 0 (0-0) / 0 (0-0) |  |
+| generic | 1,048,576 flows (--conntrack-size) | 3 | 1.38 M (1.17 M-1.53 M) | 1.09 M (922 k-1.23 M) | 67.4 (67.0-67.7) | 269 k (229 k-304 k) | 0 (0-0) / 0 (0-0) |  |
+| generic | 8,388,608 flows (--conntrack-size) | 3 | 1.68 M (1.37 M-2.08 M) | 1.26 M (1.06 M-1.45 M) | 68.0 (67.8-68.2) | 309 k (261 k-355 k) | 0 (0-0) / 0 (0-0) |  |
 <!-- /results:exp6 -->
 
 ### What was not done
 
-Experiment 6 in generic mode (being measured when this was written). A third native repeat
-in each mitigation variant (those rows have n=2). Reruns of the Experiment 2 and 6 rows
+A third native repeat in each mitigation variant (those rows have n=2). Reruns of the Experiment 2 and 6 rows
 with high spread. The XDP program's own run time per packet (`bpf_stats`) and the
 connection table's charged memory (`memlock`), which docs/CAPACITY.md describes as methods
 only.
