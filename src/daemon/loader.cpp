@@ -6,6 +6,7 @@
 #include <linux/if_link.h>
 #include <net/if.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -54,10 +55,41 @@ XdpMode current_attach_mode(int ifindex, bool* attached) {
     return XdpMode::Auto;
 }
 
+// Magic number of bpffs (include/uapi/linux/magic.h, BPF_FS_MAGIC).
+constexpr unsigned long kBpfFsMagic = 0xcafe4a11;
+
+// Pinned maps only work on a bpffs mount, and libbpf creates just one level of
+// missing directory. Create the whole pin path, then check the filesystem.
+// The check exists because of a real failure: `ip netns exec` gives the process
+// a private mount namespace with a fresh sysfs at /sys, so the host's bpffs at
+// /sys/fs/bpf is not there and mkdir fails with ENOENT. The fix on the operator's
+// side is a bpffs mounted somewhere the process can see (mount -t bpf bpf DIR).
+void ensure_pin_path(const std::string& pin_path) {
+    std::string cur;
+    for (size_t i = 1; i <= pin_path.size(); ++i) {
+        if (i == pin_path.size() || pin_path[i] == '/') {
+            cur = pin_path.substr(0, i);
+            if (mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST)
+                throw std::runtime_error("mkdir " + cur + ": " + std::strerror(errno) +
+                                         " (is a bpffs mounted here? under `ip netns exec` /sys is a fresh"
+                                         " sysfs, so use a bpffs mounted outside /sys, e.g."
+                                         " mount -t bpf bpf /run/packetbalance/bpf)");
+        }
+    }
+    struct statfs st {};
+    if (statfs(pin_path.c_str(), &st) != 0)
+        throw std::runtime_error("statfs " + pin_path + ": " + std::strerror(errno));
+    if (static_cast<unsigned long>(st.f_type) != kBpfFsMagic)
+        throw std::runtime_error("pin path " + pin_path + " is not on a bpffs mount; pinned maps"
+                                 " need one (mount -t bpf bpf DIR). Note that `ip netns exec`"
+                                 " replaces /sys, so /sys/fs/bpf is not visible there.");
+}
+
 }  // namespace
 
 Loader::Loader(const Options& opts) : opts_(opts) {
     libbpf_set_print(libbpf_print);
+    ensure_pin_path(opts_.pin_path);
 
     ifindex_ = static_cast<int>(if_nametoindex(opts_.interface.c_str()));
     if (ifindex_ == 0) throw std::runtime_error("no such interface: " + opts_.interface);
