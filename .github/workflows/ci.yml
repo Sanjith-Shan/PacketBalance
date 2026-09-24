@@ -97,6 +97,8 @@ jobs:
       - name: modules
         id: mods
         run: |
+          # Pinned maps need bpffs. Runners do not mount it by default.
+          mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
           for m in ipip ip_vs ip_vs_mh ip_vs_rr pktgen; do
             if sudo modprobe "$m"; then echo "$m=1" >> "$GITHUB_OUTPUT"; else echo "SKIP: module $m unavailable"; echo "$m=0" >> "$GITHUB_OUTPUT"; fi
           done
