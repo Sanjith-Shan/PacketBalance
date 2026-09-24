@@ -659,6 +659,25 @@ TEST_F(Dataplane, DeletedRealDrops)
     EXPECT_EQ(counter(kTcpVipId, PB_CNT_DROP_NO_REAL), 1u);
 }
 
+// A real whose address is set but whose MAC is still all zeros (unresolved,
+// or a slot the control plane is freeing) must not be sent a frame with a
+// zero destination MAC. Reachable through a conntrack entry naming its id.
+TEST_F(Dataplane, UnresolvedMacDropsNoReal)
+{
+    set_ring_all(kTcpVipId, kRealA);
+    auto syn = tcp_frame(kClient, 40012, kVip, 80, kTcpSyn);
+    expect_encap(syn, run(syn), kRealA);
+
+    pb_mac zero{};
+    uint32_t id = kRealA;
+    ASSERT_EQ(bpf_map_update_elem(fd(skel_->maps.neigh), &id, &zero, BPF_ANY), 0);
+    auto ack = tcp_frame(kClient, 40012, kVip, 80, kTcpAck);
+    EXPECT_EQ(run(ack).ret, kXdpDrop);
+    EXPECT_EQ(counter(kTcpVipId, PB_CNT_DROP_NO_REAL), 1u);
+    EXPECT_EQ(counter(kTcpVipId, PB_CNT_TX), 1u);
+    EXPECT_EQ(real_counter(kRealA).packets, 1u) << "the dropped packet is not charged to the real";
+}
+
 TEST_F(Dataplane, OversizeDropsMtu)
 {
     set_ring_all(kUdpVipId, kRealA);

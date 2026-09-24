@@ -396,8 +396,14 @@ static __always_inline int forward(struct xdp_md *ctx, const struct pb_flow *f,
     struct pb_real *real = bpf_map_lookup_elem(&reals, &real_id);
     if (!real || real->addr == 0)
         return drop_vip(st, PB_CNT_DROP_NO_REAL);
+    // `neigh` is an ARRAY, so the lookup only fails out of range. An
+    // all-zero MAC is the control plane's "not resolved yet" (or a slot
+    // being freed): the ring never gives such a real slots, but a
+    // conntrack entry can still name its id, and a frame sent to
+    // 00:00:00:00:00:00 would vanish without a counter.
     struct pb_mac *dmac = bpf_map_lookup_elem(&neigh, &real_id);
-    if (!dmac)
+    if (!dmac || !(dmac->mac[0] | dmac->mac[1] | dmac->mac[2] |
+                   dmac->mac[3] | dmac->mac[4] | dmac->mac[5]))
         return drop_vip(st, PB_CNT_DROP_NO_REAL);
 
     if (encap_ipip(ctx, real->addr, dmac, cfg, hash, inner_len, tos))

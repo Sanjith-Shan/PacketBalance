@@ -1,5 +1,6 @@
-# PacketBalance daemon configuration. This is the lab's lb1 config; lab/up.sh
-# generates the real one from this template.
+# PacketBalance daemon configuration, example for /etc/packetbalance. Its VIPs and
+# reals are the lab's; the lab writes its own per-LB configs (lab/gen/lb1.yaml,
+# lab/gen/lb2.yaml) from lab/common.sh, with pin paths under /run/pblab/bpf.
 
 interface: veth0            # interface the XDP program attaches to
 xdp_mode: auto              # native | generic | auto (native, then generic)

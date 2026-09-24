@@ -13,6 +13,7 @@ tools/hashquality/       Experiment 5, one million tuples through maglev and mod
 tools/bpftrace/          live inspection scripts
 tests/core/              Google Test, runs on any platform
 tests/dataplane/         BPF_PROG_TEST_RUN tests for the XDP program, Linux and root
+tests/daemon/            LbState, MapReader, JSON commands and /metrics on real (unpinned) maps, Linux and root
 lab/                     lima.yaml, up.sh, down.sh, ipvs.sh, pktgen.sh, measure.sh, experiments.sh, diagnose.sh
 deploy/                  systemd unit and example config
 docs/                    DESIGN, RUNBOOK, CAPACITY, BUGS, API

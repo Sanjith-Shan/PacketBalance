@@ -23,7 +23,6 @@
 // One thread, epoll. RLIMIT_NOFILE is raised to fit.
 
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
@@ -55,7 +54,7 @@ int64_t now_ms() {
     return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
 }
 
-enum class State { Idle, Connecting, Open, Broken, ConnectFailed, Closed };
+enum class State { Idle, Connecting, Open, Broken, ConnectFailed };
 enum Cause { kRst = 0, kEof, kTimeout, kWrongBackend, kNumCauses };
 const char* kCauseName[kNumCauses] = {"rst", "eof", "timeout", "wrong_backend"};
 
@@ -67,7 +66,6 @@ struct Conn {
     int64_t hb_sent_at = 0;    // 0 when no heartbeat is outstanding
     int64_t next_hb = 0;
     uint64_t seq = 0;
-    uint64_t replies = 0;
     std::string in;
 };
 
@@ -221,10 +219,9 @@ private:
         Conn& c = conns_[i];
         int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0) {
-            std::fprintf(stderr, "conncheck: socket: %s\n", std::strerror(errno));
-            c.state = State::ConnectFailed;
-            ++connect_failed_;
-            ++connect_fail_reasons_[errno];
+            const int err = errno;  // fprintf may clobber errno
+            std::fprintf(stderr, "conncheck: socket: %s\n", std::strerror(err));
+            fail_connect(c, err);
             return;
         }
         int one = 1;
@@ -362,7 +359,6 @@ private:
             c.in.erase(0, pos + 1);
             if (line.rfind("id=", 0) != 0) continue;  // not ours, ignore
             int id = std::atoi(line.c_str() + 3);
-            ++c.replies;
             c.hb_sent_at = 0;
             c.next_hb = now + o_.heartbeat_ms;
             if (c.backend < 0) {

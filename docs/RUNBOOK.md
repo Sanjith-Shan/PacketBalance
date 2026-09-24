@@ -12,7 +12,7 @@ Commands are written for a single host installed from `deploy/`, with the defaul
 |---|---|---|
 | Config | `/etc/packetbalance/packetbalance.yaml` | `lab/gen/lb1.yaml`, `lab/gen/lb2.yaml` |
 | Control socket | `/run/packetbalance.sock` | `/run/pblab/pb-lb1.sock`, `/run/pblab/pb-lb2.sock` |
-| Pinned maps | `/sys/fs/bpf/packetbalance/` | `/sys/fs/bpf/packetbalance/lb1/`, `.../lb2/` |
+| Pinned maps | `/sys/fs/bpf/packetbalance/` | `/run/pblab/bpf/lb1/`, `/run/pblab/bpf/lb2/` (the lab's own bpffs) |
 | Interface | from the config (`interface:`) | `veth0` inside netns `lb1` or `lb2` |
 | Metrics | `127.0.0.1:9101/metrics` | the same, inside each LB's netns |
 | Daemon log | `journalctl -u packetbalance` | `/run/pblab/pb-lb1.log` |
@@ -21,6 +21,14 @@ In the lab, prefix interface and metrics commands with `ip netns exec lb1`, and 
 `pbctl` the socket, for example `pbctl --socket /run/pblab/pb-lb1.sock stats`. Unix
 sockets are not bound to a network namespace, so `pbctl` itself can run from anywhere.
 `bpftool` also runs from the root namespace, because bpffs pins are global.
+
+**The `ip netns exec` bpffs trap.** `ip netns exec` gives the command a private mount
+namespace and mounts a fresh sysfs on `/sys`, so the host's bpffs at `/sys/fs/bpf` is not
+visible inside it. A daemon started that way with a pin path under `/sys/fs/bpf` fails
+with `mkdir ...` or `pin path ... is not on a bpffs mount`. The lab therefore mounts its
+own bpffs at `/run/pblab/bpf` in the root mount namespace, which every `ip netns exec`
+inherits, and gives each LB a directory there. Use those paths with `bpftool` in the lab,
+not `/sys/fs/bpf/packetbalance/lb1`, which does not exist.
 
 The examples use the lab's VIP and reals, `198.51.100.1:80/tcp` and `10.0.0.21` to
 `10.0.0.24`.
@@ -73,7 +81,7 @@ Verify, in this order:
 
 ```sh
 systemctl status packetbalance              # active (running)
-journalctl -u packetbalance -n 50           # "attached xdp_packetbalance to <if> in native mode"
+journalctl -u packetbalance -n 50           # "attached xdp_packetbalance to <if> (ifindex N) in native mode"
 ip -d link show dev <if>                    # "prog/xdp id N" (native) or "prog/xdpgeneric id N"
 pbctl ping                                  # pong
 pbctl vip list                              # every VIP from the config, reals up
@@ -137,7 +145,8 @@ Use it for a real that is already dead. For a live real, drain first.
 
 ## Drain a real for maintenance
 
-Draining sets the real's weight to 0. It takes no ring slots, so no new flow hashes to
+Draining takes the real out of the ring as if its weight were 0, while keeping its
+configured weight (`vip list` and `pb_real_weight` still show it). No new flow hashes to
 it, and existing flows keep reaching it through the connection table. Health checks
 continue.
 
@@ -178,7 +187,8 @@ drain on their own. Decide how long to wait before starting. For UDP, `age_ms` i
 only signal that a flow is idle.
 
 To return the real to service, `pbctl real undrain 198.51.100.1:80/tcp 10.0.0.23`, which
-restores its configured weight, or `real add` if it was deleted.
+gives it ring slots for its configured weight again (if it is up), or `real add` if it was
+deleted.
 
 What a drain does not protect. A flow that misses the connection table (evicted from a
 full LRU, or processed on a different CPU than before) re-hashes, and the drained real is
@@ -203,7 +213,8 @@ in the YAML.
 ## Hitless daemon restart
 
 Stopping the daemon does not detach the XDP program or delete the maps, so forwarding
-continues while the daemon is down. Health checks, the API and metrics stop.
+continues while the daemon is down. Health checks, neighbor resolution, the API and
+metrics stop.
 
 Prove it with live connections. In one terminal, hold connections through the VIP (in the
 lab, from the client namespace):
@@ -308,7 +319,7 @@ a little on every run.
 **3. Are the maps what the daemon thinks they are?**
 
 ```sh
-P=/sys/fs/bpf/packetbalance
+P=/sys/fs/bpf/packetbalance          # the lab: P=/run/pblab/bpf/lb1
 bpftool map dump pinned $P/vip_map
 bpftool map dump pinned $P/reals
 bpftool map dump pinned $P/neigh
@@ -333,7 +344,7 @@ counters is climbing.
 
 | Drop reason | Meaning | Usual cause |
 |---|---|---|
-| `no_real` | The ring slot had no real, or the real's slot in `reals` or `neigh` was empty | Every real down, draining or unresolved. `pbctl health`, `pbctl ring show` (`none` > 0) |
+| `no_real` | The ring slot had no real (or no ring is installed), or the chosen real's `reals` slot is empty or its `neigh` MAC is all zeros | Every real down, draining or unresolved. `pbctl health`, `pbctl ring show` (`none` > 0) |
 | `mtu` | Inner packet plus 20 bytes exceeds 3,500 | Jumbo frames from clients. See [MTU](#diagnose-mtu-black-hole-for-large-requests) |
 | `frag` | IPv4 fragment (MF set or non-zero offset). Counted globally | A client or middlebox fragmenting, usually large UDP. PacketBalance never forwards fragments |
 | `opts` | IPv4 header with options. Counted globally | Rare. Some scanners and old stacks |
@@ -402,8 +413,8 @@ requests, while the others are busy.
    maintenance looks exactly like this.
 3. **Is its MAC unresolved?** A real whose MAC the daemon never resolved gets no ring
    slots. `journalctl -u packetbalance | grep 'neigh: no ARP entry'`, and
-   `bpftool map dump pinned /sys/fs/bpf/packetbalance/neigh` (all zeros for its
-   `real_id`). Check `ip neigh show 10.0.0.23` on the LB and whether the real answers
+   `bpftool map dump pinned /sys/fs/bpf/packetbalance/neigh` (in the lab
+   `/run/pblab/bpf/lb1/neigh`), all zeros for its `real_id`. Check `ip neigh show 10.0.0.23` on the LB and whether the real answers
    ARP at all.
 4. **Does the ring agree?** `pbctl ring show 198.51.100.1:80/tcp`. Zero slots for the real
    confirms one of the three causes above. A normal slot count means the ring is fine and
@@ -432,9 +443,11 @@ of clients see resets or timeouts. First decide which deploy.
 - **Did the XDP mode change?** Look for `(not hitless)` in the log.
 - **Does the unit detach on exit?** `systemctl cat packetbalance | grep detach`.
   `--detach-on-exit` in `ExecStart` turns every restart into an outage.
-- **Did the ring change during the deploy?** Compare `pb_ring_generation` before and
-  after. A restart with unchanged config rebuilds the ring once, identically. Several
-  increments mean something else changed.
+- **Did the ring change during the deploy?** `pb_ring_generation` counts swaps since the
+  daemon started, so it restarts from 0. After a restart with unchanged config it is 1
+  for every VIP (the one identical rebuild at startup), plus one per real whose MAC had
+  to be resolved again. Anything higher means health transitions or API changes. Compare
+  `pbctl ring show` slot counts before and after to see whether the contents changed.
 
 **A backend deploy.**
 
@@ -478,7 +491,8 @@ it), but see the ICMP note below.
    packet. On the LB's link peer (`tcpdump -ni pb-lb1 -e 'ip proto 4 and greater 1500'`)
    look for encapsulated frames above the path MTU toward the reals, then check the real's
    receive drops (`ip -s link show dev <nic>`) or the switch's.
-2. **Did the LB drop it?** `pbctl stats` `drop_mtu` counts only packets above 3,500 bytes.
+2. **Did the LB drop it?** `drop_mtu` in `pbctl --json stats` counts only packets above
+   3,500 bytes.
    Packets between the path MTU and 3,500 are sent and dropped downstream, uncounted by
    PacketBalance.
 3. **Fix the path or the MSS.** Either raise the MTU of every link between the LBs and the
@@ -491,7 +505,7 @@ it), but see the ICMP note below.
    that cannot forward the real's large reply sends ICMP "fragmentation needed" to the VIP,
    which arrives at the LB. With the PMTU feature flag on (`PB_CFG_F_ICMP_PMTU` in the
    `config` map, visible in `bpftool map dump pinned .../config`), the LB forwards it to
-   the real that owns the flow and `icmp_pmtu_fwd` in `pbctl stats` counts it. With the
+   the real that owns the flow and `icmp_pmtu_fwd` in `pbctl --json stats` counts it. With the
    flag off, the ICMP is passed to the LB host, which ignores it, and the real never
    lowers its MTU.
 
@@ -512,9 +526,10 @@ Served on `127.0.0.1:9101/metrics` in Prometheus text format, summed across CPUs
 | `pb_drops_total{vip,reason}` | Drops by reason, table above. `frag`, `opts`, `short` and `other` are counted before the VIP is known |
 | `pb_real_packets_total{real}` | Packets sent to each real, across VIPs |
 | `pb_real_up{vip,real}` | 1 if the health checker considers the real up |
-| `pb_real_weight{vip,real}` | Configured weight, 0 while draining |
-| `pb_ring_generation{vip}` | Increments on every ring swap |
-| `pb_conntrack_entries` | Entries in the connection table |
+| `pb_real_weight{vip,real}` | Configured weight. A drain does not change it; `pbctl vip list` shows `draining` and `in_ring` |
+| `pb_ring_generation{vip}` | Increments on every ring swap. Restarts from 0 with the daemon |
+| `pb_conntrack_entries` | Keys (flows) in the connection table, not per-CPU values. An O(entries) walk per scrape |
+| `pb_xdp_mode{mode}` | 1 for the attach mode in effect, `native` or `generic` |
 
 Things worth knowing when reading them. `pb_conntrack_misses_total` is not an error
 count. A second LB taking over flows, a flow changing CPU, and LRU eviction all show up
@@ -559,7 +574,8 @@ groups:
         expr: pb_conntrack_entries / 1048576 > 0.9
         for: 15m
       - alert: PBRingsDisagree
-        # Same VIP, different ring contents across the tier.
+        # Same VIP, different ring contents across the tier. Blind to drains and
+        # unresolved MACs, which the metrics do not export; compare `pbctl ring show`.
         expr: count by (vip, real) (count_values by (vip, real) ("w", pb_real_weight * pb_real_up)) > 1
         for: 5m
 ```

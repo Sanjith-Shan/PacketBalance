@@ -40,7 +40,15 @@ std::chrono::milliseconds HealthChecker::step() {
     const auto start = Clock::now();
     const std::vector<HealthTarget> targets = state_.health_targets();
     const std::vector<ProbeResult> results = probe_all(targets, std::chrono::milliseconds(p.timeout_ms));
-    for (size_t i = 0; i < targets.size(); ++i) state_.report_health(targets[i], results[i], p.rise, p.fall);
+    size_t local_errors = 0;
+    std::string local_detail;
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (results[i].local_error && local_errors++ == 0) local_detail = results[i].detail;
+        state_.report_health(targets[i], results[i], p.rise, p.fall);
+    }
+    if (local_errors)
+        log::warn("health: {} of {} probes could not be made ({}); not counted for or against the reals",
+                  local_errors, targets.size(), local_detail);
 
     const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start);
     const auto interval = std::chrono::milliseconds(p.interval_ms);
@@ -54,6 +62,11 @@ std::vector<ProbeResult> HealthChecker::probe_all(const std::vector<HealthTarget
     std::vector<Clock::time_point> started(targets.size());
     std::vector<bool> pending(targets.size(), false);
 
+    // Errors that describe the LB, not the real: see ProbeResult::local_error.
+    auto is_local = [](int err) {
+        return err == EMFILE || err == ENFILE || err == ENOBUFS || err == ENOMEM ||
+               err == EADDRNOTAVAIL || err == EAGAIN;
+    };
     auto finish = [&](size_t i, bool ok, std::string detail) {
         results[i].ok = ok;
         results[i].detail = std::move(detail);
@@ -67,7 +80,9 @@ std::vector<ProbeResult> HealthChecker::probe_all(const std::vector<HealthTarget
         started[i] = Clock::now();
         socks[i].reset(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
         if (!socks[i]) {
-            finish(i, false, std::string("socket: ") + std::strerror(errno));
+            const int err = errno;
+            finish(i, false, std::string("socket: ") + std::strerror(err));
+            results[i].local_error = is_local(err);
             continue;
         }
         sockaddr_in sa{};
@@ -78,8 +93,11 @@ std::vector<ProbeResult> HealthChecker::probe_all(const std::vector<HealthTarget
             finish(i, true, "connected");
         else if (errno == EINPROGRESS)
             pending[i] = true;
-        else
-            finish(i, false, std::strerror(errno));
+        else {
+            const int err = errno;
+            finish(i, false, std::strerror(err));
+            results[i].local_error = is_local(err);
+        }
     }
 
     const auto deadline = Clock::now() + timeout;

@@ -336,6 +336,9 @@ void LbState::report_health(const HealthTarget& t, const ProbeResult& r, uint32_
     auto mit = v.members.find(t.addr);
     // Deleted (or deleted and re-added) while the probe was in flight.
     if (mit == v.members.end() || mit->second.incarnation != t.incarnation) return;
+    // Our own failure to probe says nothing about the real. Counting it would
+    // take healthy reals out of the ring whenever the LB runs out of fds.
+    if (r.local_error) return;
     Member& m = mit->second;
 
     const std::string real = ipv4_to_string(t.addr);

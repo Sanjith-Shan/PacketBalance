@@ -46,6 +46,10 @@ struct ProbeResult {
     bool ok = false;
     uint32_t rtt_us = 0;
     std::string detail;  // e.g. "Connection refused", "timeout"
+    // The probe could not be made for a reason local to the LB (out of file
+    // descriptors, ephemeral ports or buffers). Not evidence about the real,
+    // so it is not counted either way.
+    bool local_error = false;
 };
 
 struct RealView {

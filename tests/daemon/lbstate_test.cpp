@@ -240,6 +240,21 @@ TEST_F(ControlPlane, ProbeOfADeletedAndReaddedRealIsIgnored) {
     EXPECT_GT(ring_counts(kTcpVip)[id], 0u);
 }
 
+// A probe the LB itself could not make (EMFILE and the like) is no evidence
+// about the real and must not take it out of the ring.
+TEST_F(ControlPlane, LocalProbeErrorsDoNotCount) {
+    state_->add_vip(kTcpVip, false);
+    const uint32_t id = state_->add_real(kTcpVip, ip("10.0.0.21"), 1);
+    const HealthTarget t = state_->health_targets().at(0);
+    ProbeResult local{false, 0, "socket: Too many open files"};
+    local.local_error = true;
+    for (uint32_t i = 0; i < kFall * 2; ++i) state_->report_health(t, local, kRise, kFall);
+    EXPECT_EQ(ring_counts(kTcpVip)[id], PB_RING_SIZE);
+    const RealView r = state_->find(kTcpVip)->reals.at(0);
+    EXPECT_TRUE(r.up);
+    EXPECT_EQ(r.consecutive_fail, 0u);
+}
+
 // ---- map reader ---------------------------------------------------------------
 
 TEST_F(ControlPlane, FlowWalkerSkipsOtherCpusZeroValues) {

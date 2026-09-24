@@ -134,17 +134,32 @@ bool RealTable::set_mac(uint32_t addr, const Mac& mac) {
     return true;
 }
 
-// neigh is written before reals so that the moment the data plane can see an
-// address for this id, it also has the MAC to send to.
+// Order matters because the data plane reads the two arrays without a lock.
+// Filling a slot writes neigh before reals, so the moment the data plane can
+// see an address for this id it also has the MAC to send to. Freeing a slot
+// clears reals first, so a conntrack entry naming the id becomes a miss
+// before its MAC disappears. (The data plane also drops, as no_real, a real
+// whose MAC is all zeros.)
 void RealTable::write_slot(uint32_t id) {
     const Slot& s = slots_[id];
     pb_mac m{};
     if (s.mac) std::memcpy(m.mac, s.mac->bytes.data(), 6);
-    if (int err = bpf_map_update_elem(neigh_fd_, &id, &m, BPF_ANY))
-        throw std::runtime_error("write neigh[" + std::to_string(id) + "]: " + std::strerror(-err));
-    pb_real r{.addr = s.addr, .flags = 0};
-    if (int err = bpf_map_update_elem(reals_fd_, &id, &r, BPF_ANY))
-        throw std::runtime_error("write reals[" + std::to_string(id) + "]: " + std::strerror(-err));
+    const pb_real r{.addr = s.addr, .flags = 0};
+    auto write_neigh = [&] {
+        if (int err = bpf_map_update_elem(neigh_fd_, &id, &m, BPF_ANY))
+            throw std::runtime_error("write neigh[" + std::to_string(id) + "]: " + std::strerror(-err));
+    };
+    auto write_real = [&] {
+        if (int err = bpf_map_update_elem(reals_fd_, &id, &r, BPF_ANY))
+            throw std::runtime_error("write reals[" + std::to_string(id) + "]: " + std::strerror(-err));
+    };
+    if (s.addr != 0) {
+        write_neigh();
+        write_real();
+    } else {
+        write_real();
+        write_neigh();
+    }
 }
 
 }  // namespace pb

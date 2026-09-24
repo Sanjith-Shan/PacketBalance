@@ -211,7 +211,7 @@ counted under the reason named in `enum pb_counter` in `abi.h`.
      `conntrack` (overwriting a stale entry) unless it is `PB_REAL_NONE`, the packet is
      ICMP, or the packet is a TCP RST.
 9. **Resolve the real.** `real_id` out of range (including the `PB_REAL_NONE` sentinel),
-   an empty `reals` slot, or a missing `neigh` entry: drop, `no_real`.
+   an empty `reals` slot, or an all-zero MAC in `neigh` (unresolved): drop, `no_real`.
 10. **Encapsulate and transmit.** `bpf_xdp_adjust_head(-20)` (failure: drop,
     `adj_head`), write Ethernet and the outer IPv4 header, compute the outer checksum,
     count `tx` and the per-real `real_stats`, return `XDP_TX`.
@@ -467,7 +467,9 @@ first round only and one turn per round after that. `MaglevHashV2` accumulates w
 each round and grants a turn when the accumulator passes the maximum weight, which gives
 proportional shares. PacketBalance's scheme is closer to V2 in effect.
 
-Weight 0 means the real takes no slots. That is how draining works.
+Weight 0 means the real takes no slots. The daemon passes weight 0 to the ring builder
+for any real that is draining, down or has no resolved MAC, while keeping its configured
+weight, so undrain or recovery restores the old share.
 
 ### Keyed by address, not by real_id
 
@@ -777,7 +779,8 @@ there is no handshake to test. Their reals are always up and are reported with
 `"checked": false`. `--no-health-check` (or `health_check.enabled: false`) turns
 checking off for every VIP; that setting takes effect on restart only. A real
 goes down after `fall` (3) consecutive failures and comes back after `rise` (2)
-consecutive successes. Any transition rebuilds that VIP's ring and swaps it, and logs one
+consecutive successes. A probe the load balancer could not make itself (out of file
+descriptors or ephemeral ports) counts neither way. Any transition rebuilds that VIP's ring and swaps it, and logs one
 line with a timestamp (`UP->DOWN after 3 failures`, `DOWN->UP after 2 successes`), which
 Experiment 3 reads.
 
@@ -816,20 +819,22 @@ descriptors, so it stays attached after the daemon exits. Stopping the daemon th
 leaves forwarding running, with the maps, the rings and the connection table intact.
 Only health checking, neighbor resolution, the API and metrics stop.
 
-On restart the daemon:
+On restart the daemon, in this order:
 
 1. Reuses every pinned map.
-2. Adopts the existing `real_id` assignments from the pinned `reals` and `neigh` maps.
+2. Loads the program from its embedded skeleton and attaches it with `bpf_xdp_attach`
+   without `XDP_FLAGS_UPDATE_IF_NOEXIST`, which replaces the running program atomically.
+   There is no instant with no program attached, and the new program starts on the old
+   rings and connection table.
+3. Adopts the existing `real_id` assignments from the pinned `reals` and `neigh` maps.
    This matters because every connection-table entry stores a `real_id`. A daemon that
    renumbered reals on restart would silently send every established flow to a
    different real.
-3. Adopts existing `vip_id` assignments from `vip_map`, so rings and counters stay with
+4. Adopts existing `vip_id` assignments from `vip_map`, so rings and counters stay with
    their VIPs.
-4. Rebuilds each ring from the configuration and swaps it in. If the configuration and
-   eligibility have not changed, the new ring is identical to the old one.
-5. Loads the program from its embedded skeleton and attaches it with `bpf_xdp_attach`
-   without `XDP_FLAGS_UPDATE_IF_NOEXIST`, which replaces the running program atomically.
-   There is no instant with no program attached.
+5. Rebuilds each ring from the configuration and swaps it in. If the configuration and
+   eligibility have not changed, the new ring is identical to the old one. Pinned VIPs
+   and reals the configuration no longer has are removed after that.
 
 Rolling a new data-plane object is the same operation, since the object is embedded in
 the daemon binary. It is hitless as long as the new object's map definitions match the
