@@ -149,10 +149,11 @@ inner checksum changes.
 
 **4. Back onto the wire.** `XDP_TX` hands the frame back to lb1's `veth0` transmit side.
 It appears on `pb-lb1`, and the bridge forwards it by destination MAC to `pb-real1` and
-into real1. On a veth, `XDP_TX` only works if the peer device runs NAPI, which on kernel
-6.8 means the peer has an XDP program or GRO enabled. `lab/up.sh` turns GRO on for
-`pb-lb1` and `pb-lb2` for this reason. Without it, native-mode `XDP_TX` frames vanish
-without a counter in PacketBalance's stats.
+into real1. On a veth, a native-mode `XDP_TX` frame is put on the peer's XDP ring and is
+delivered only if the peer drains that ring. Enabling GRO on the peer, the documented way
+to switch on its NAPI, did not deliver the frames on kernel 6.8, so `lab/up.sh` attaches a
+do-nothing XDP_PASS program to `pb-lb1` and `pb-lb2` ([BUGS.md](BUGS.md) #22). Without it,
+native-mode `XDP_TX` frames vanish, still counted as `tx` in PacketBalance's stats.
 
 **5. Decapsulation on real1.** real1's IP layer receives a packet addressed to its own
 address 10.0.0.21 with protocol 4. The `ipip` module hands it to the fallback tunnel
@@ -214,7 +215,9 @@ counted under the reason named in `enum pb_counter` in `abi.h`.
    an empty `reals` slot, or an all-zero MAC in `neigh` (unresolved): drop, `no_real`.
 10. **Encapsulate and transmit.** `bpf_xdp_adjust_head(-20)` (failure: drop,
     `adj_head`), write Ethernet and the outer IPv4 header, compute the outer checksum,
-    count `tx` and the per-real `real_stats`, return `XDP_TX`.
+    count `tx` and the per-real `real_stats`, return `XDP_TX`. `tx` therefore counts
+    XDP_TX verdicts, not frames the driver delivered; see
+    [What the VM measured](#what-the-vm-measured).
 11. **ICMP.** If the PMTU feature flag is off, or the message is not "destination
     unreachable, fragmentation needed", `XDP_PASS`. Otherwise parse the quoted inner
     header, which is the real's reply (VIP to client). Swap it back into the client to
@@ -282,8 +285,8 @@ There are three attach modes, and they are not the same system.
 
 PacketBalance tries native first and falls back to generic (`xdp_mode: auto`). Every
 result row records which mode ran, because generic mode's cost is the honest cost of a
-device without driver support. If generic mode does not beat IPVS in Experiment 1, that
-is published.
+device without driver support. In the lab VM neither mode beat IPVS in Experiment 1, and
+that is published (next section).
 
 The lab has a caveat of its own. PacketBalance attaches to a veth. Native XDP on a veth
 runs in the veth's NAPI context, but the frame started life as an skb on the sending
@@ -291,6 +294,35 @@ side, and the veth converts it to an XDP buffer, copying if the skb is shared or
 headroom. So "native" on veth avoids the receiving stack but not the skb. A physical NIC
 in native mode avoids both. [CAPACITY.md](CAPACITY.md) covers what that means for the
 numbers.
+
+### What the VM measured
+
+In the lab VM (6 vCPUs, kernel 6.8, 64-byte UDP, 10,000 flows) native XDP delivered
+582 kpps to the reals, generic XDP 1.39 Mpps and IPVS `mh` 2.21 Mpps. Native XDP lost,
+and the packet accounting says where. On a veth, a frame reaches the LB through the
+bridge-side peer's transmit into the LB veth's 256-slot ptr_ring; the program runs in
+that veth's NAPI poll on the CPU of the thread that sent the frame; and `XDP_TX` puts the
+frame on the peer's 256-slot ring, where a second XDP program has to turn it into an skb
+for the bridge. In a 30 s window at saturation about 141 M frames were offered, about
+100 M were dropped because the first ring was full before the program ever ran, the
+program returned `XDP_TX` for about 40.5 M, about 21 M of those were dropped because the
+peer's ring was full, and about 19.5 M arrived. The program's own drop counters were 0,
+the conntrack hit rate was above 99.9%, and the generator's four CPUs were saturated
+while the other two idled. IPVS and generic XDP go through the stack's backlog queue,
+which slows the generator and drops less.
+
+None of that exists on a physical NIC. There the program runs on the driver's receive
+ring on the CPUs that take the NIC's interrupts, RSS spreads flows across queues, and
+`XDP_TX` writes to the NIC's own transmit ring. The VM result is a statement about the
+veth driver under a generator on the same CPUs, which is why the VM number is treated as
+a lower bound and not as evidence about XDP.
+
+One lesson does carry over. The program's `tx` counter counts `XDP_TX` verdicts, not
+frames the driver transmitted; here it read 2.6 times what arrived. A driver that cannot
+queue an `XDP_TX` frame drops it after the program has returned, and the program cannot
+see that. A deployment should export the driver's own counter beside `tx` (for veth and
+most NIC drivers, `xdp_tx_errors` or an equivalent in `ethtool -S`) and alert on the
+difference. [RUNBOOK.md](RUNBOOK.md) has the check.
 
 ## Why DSR with IPIP, not NAT
 
@@ -550,6 +582,20 @@ lifetime. RSS makes that rare. The NIC hashes each flow to one receive queue, ea
 is served by one CPU, and so all packets of a flow are normally processed on the same
 CPU. It changes when RSS indirection tables or IRQ affinity are reconfigured, or when a
 queue's interrupt moves.
+
+Experiment 3's `add` scenario measured the cost where RSS does not help. With 10,000
+connections established and real5 added to the ring for 10 s, PacketBalance broke 228
+connections on average (20 to 350 over three runs, 2.3%), all by reset, while IPVS `mh`
+broke 0 and PacketBalance without the table broke 24.8%. Each broken flow had a
+heartbeat processed on a CPU that had no entry for it; the ring lookup then sent about a
+fifth of those to real5, which reset the unknown connection. In the lab a veth runs the
+program on whichever CPU the sending thread was scheduled on, so flows change CPU far
+more often than behind a NIC with RSS, and 2.3% is closer to a worst case than a
+typical one. IPVS breaks nothing here because it keeps one connection table shared by all
+CPUs, and pays for that with locking on the fast path. That is the same trade-off made
+the other way: PacketBalance buys lock-free scaling with the assumption that a flow stays
+on one CPU, and pays for it in the rare case that the assumption fails during a ring
+change.
 
 Katran gets per-CPU tables differently, with an `ARRAY_OF_MAPS` of ordinary `LRU_HASH`
 maps indexed by CPU number. See

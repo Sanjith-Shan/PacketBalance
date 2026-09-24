@@ -203,10 +203,12 @@ puts the frame on the peer's (pb-lb1's) 256-entry ptr_ring, and when the ring
 is full `veth_xdp_xmit` drops it; the drop is visible only as lb1 veth0
 `rx_queue_N_xdp_tx_errors` (and `tx_dropped`, and pb-lb1 `rx_dropped`, the same
 event three times). In generic mode XDP_TX goes through the veth's normal
-transmit and shows as lb1 veth0 `tx_dropped`. At saturation, per 30 s window:
-150 M offered, 108 M dropped before the program (lb1's own receive ring full,
-pb-lb1 `tx_dropped`), 42 M XDP_TX'd, 23 M lost to the full pb-lb1 ring, 19 M
-received, 4.5 k dropped by the reals' backlog, 0.3% timing skew. The program's
+transmit and shows as lb1 veth0 `tx_dropped`. At saturation, per 30 s window
+(the two `standard` rows of `results/exp1_mitigations.jsonl`): about 141 M offered,
+about 100 M dropped before the program (lb1's own receive ring full, pb-lb1
+`tx_dropped`), about 40.5 M XDP_TX'd, about 21 M lost to the full pb-lb1 ring, about
+19.5 M received, 9 to 15 k dropped by the reals' backlog, under 0.1% of offered
+unaccounted for (timing skew). The program's
 own drop counters were 0.
 
 **Fix.** The harness, not the program: every packet-rate row carries

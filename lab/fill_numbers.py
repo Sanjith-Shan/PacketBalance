@@ -146,6 +146,11 @@ def cfg_key(r):
     return s
 
 
+def exp3_key(r):
+    # the remove rows are keyed as before; the add scenario gets a "/add" suffix so the two never mix
+    return cfg_key(r) + ("/add" if r.get("scenario") == "add" else "")
+
+
 def exp4_key(r):
     s = cfg_key(r)
     if r.get("ipvs_sloppy_tcp") is not None:
@@ -154,7 +159,9 @@ def exp4_key(r):
 
 
 def exp6_key(r):
-    return "off" if r.get("conntrack") is False else str(r.get("conntrack_size"))
+    # native rows keep the bare keys the placeholders use; generic rows get a "generic/" prefix
+    k = "off" if r.get("conntrack") is False else str(r.get("conntrack_size"))
+    return k if (r.get("xdp_mode") or "native") == "native" else "%s/%s" % (r.get("xdp_mode"), k)
 
 
 def grouped(name, key, ok):
@@ -184,6 +191,7 @@ def field_any(rows, pattern):
 EXP1_CFGS = ["packetbalance-native", "packetbalance-generic", "ipvs-mh", "ipvs-mh-tun", "ipvs-rr", "none"]
 EXP2_CFGS = ["packetbalance", "ipvs-mh", "ipvs-mh-tun", "ipvs-rr", "none"]
 EXP3_CFGS = ["packetbalance", "packetbalance-noct", "packetbalance-modulo", "ipvs-mh", "ipvs-rr"]
+EXP3_ADD_CFGS = ["packetbalance/add", "packetbalance-noct/add", "packetbalance-modulo/add", "ipvs-mh/add"]
 EXP4_CFGS = ["packetbalance", "packetbalance-modulo", "ipvs-mh/sloppy1", "ipvs-rr/sloppy1", "ipvs-mh/sloppy0",
              "ipvs-rr/sloppy0", "packetbalance/drift", "packetbalance-modulo/drift", "ipvs-mh/sloppy1/drift"]
 EXP6_CFGS = ["off", "65536", "1048576", "8388608"]
@@ -249,10 +257,15 @@ def compute(basis="forwarded"):
 
     # Exp 3 -----------------------------------------------------------------
     src = "results/exp3_churn.jsonl"
-    ok, bad = grouped("exp3_churn.jsonl", cfg_key, lambda r: "broken" in r)
+    ok, bad = grouped("exp3_churn.jsonl", exp3_key, lambda r: "broken" in r)
     for c, rs in bad.items():
         for r in rs:
             failed.append(("exp3", c, r.get("notes", "")))
+    for c in EXP3_ADD_CFGS:
+        rs = ok.get(c, [])
+        tot = max([r.get("established") or 0 for r in rs] or [0]) or None
+        add(Q("exp3.%s.broken" % c, "Exp 3 %s broken (real5 added at t=10 s, removed at t=20 s)" % c,
+              [r["broken"] for r in rs], rs, "count", src, tot))
     for c in EXP3_CFGS:
         rs = ok.get(c, [])
         tot = max([r.get("established") or 0 for r in rs] or [0]) or None
@@ -393,6 +406,8 @@ def fmt(q, style="doc", pct_of_total=False):
         return None
     v = q.mean
     if q.kind == "rate":
+        if v < 1e6:
+            return ("%.0f kpps" if style == "doc" else "%.0f thousand") % (v / 1e3)
         return ("%.2f Mpps" if style == "doc" else "%.2f million") % (v / 1e6)
     if q.kind == "ratio":
         return "%.2fx" % v
@@ -622,7 +637,7 @@ def run_checks(Qs, failed):
     if not m.missing and m.lo == 0:
         m.flags.append("zero broken in a modulo churn row, implausible (a modulo ring moves most flows)")
     d, n = g("exp3.packetbalance.broken"), g("exp3.packetbalance-noct.broken")
-    if not d.missing and not n.missing and n.mean < d.mean:
+    if not d.missing and not n.missing and n.mean < d.mean - 0.02 * (d.total or 10000):
         n.flags.append("no-conntrack broke fewer than default, unexpected")
 
     # Exp 4

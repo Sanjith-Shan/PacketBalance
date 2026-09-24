@@ -107,14 +107,14 @@ def exp1_table(rows, title="Experiment 1: packet rate at saturation"):
     ps = rows[0].get("pkt_size")
     out = ["### %s" % title, "",
            "%s-byte UDP frames (%s-byte skb), %s flows, %s s windows. " %
-           (ps, rows[0].get("pkt_size_skb"), rows[0].get("flows"), round(rows[0].get("duration_s") or 0)) +
+           (ps, rows[0].get("pkt_size_skb"), format(rows[0].get("flows") or 0, ","), round(rows[0].get("duration_s") or 0)) +
            provenance(rows), "",
            "| Configuration | n | Offered pps | LB counted pps | Received at reals pps | VM CPU busy % | Received pps per core (est.) | LB drops / veth XDP_TX errors pps |",
            "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for label, rs in group(rows, config_label).items():
         ok = [r for r in rs if r.get("received_pps") is not None]
         if not ok:
-            out.append("| %s | 0 | %s | | | | |" % (label, rs[0].get("notes", "failed")))
+            out.append("| %s | 0 | %s | | | | | |" % (label, rs[0].get("notes", "failed")))
             continue
         out.append("| %s | %d | %s | %s | %s | %s | %s | %s |" % (
             label, len(ok),
@@ -388,7 +388,10 @@ def main():
         if not pat.search(text):
             print("README.md has no <!-- results:%s --> markers; skipped" % k, file=sys.stderr)
             continue
-        text = pat.sub(lambda m: m.group(1) + "\n" + t + "\n" + m.group(3), text)
+        # the README gives each experiment its own heading and prose above the markers, so the
+        # generated block drops its leading "### ..." title to avoid a duplicate heading
+        body = re.sub(r"\A### [^\n]*\n\n", "", t)
+        text = pat.sub(lambda m, body=body: m.group(1) + "\n" + body + "\n" + m.group(3), text)
         changed = True
     if changed:
         open(readme, "w").write(text)

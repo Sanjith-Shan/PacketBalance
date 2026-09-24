@@ -396,9 +396,10 @@ for the VIP pulls traffic away from the LB entirely, and the symptom is intermit
 errors, `ipip` messages, and martian-source logs (enable with
 `sysctl -w net.ipv4.conf.all.log_martians=1`). On a physical NIC, `ethtool -S <if> | grep
 -i xdp` shows driver-level XDP transmit errors, which PacketBalance's counters cannot see.
-On a veth, native `XDP_TX` frames are dropped silently if the peer is not running NAPI.
-The lab enables GRO on `pb-lb1` and `pb-lb2` for this reason. Check with
-`ethtool -k pb-lb1 | grep generic-receive-offload`.
+On a veth, native `XDP_TX` frames are dropped silently if the peer has no XDP program to
+drain its XDP ring. The lab attaches a do-nothing XDP_PASS program to `pb-lb1` and
+`pb-lb2` for this reason (enabling GRO on the peer did not work on kernel 6.8, see
+[BUGS.md](BUGS.md) #22). Check with `ip link show pb-lb1`, which must list `prog/xdp`.
 
 ## Diagnose: one real gets no traffic
 
@@ -480,6 +481,48 @@ of clients see resets or timeouts. First decide which deploy.
 - **Do the LBs agree?** Run `pbctl ring show` on each LB and compare slot counts per real.
   Different counts mean different rings, and any ECMP reshuffle during the deploy moves
   flows onto the wrong real.
+
+## Diagnose: the LB says it forwarded but the reals see less
+
+The symptom is that `tx` (`pbctl stats`, `pb_tx_total`) climbs faster than the reals'
+receive counters, or than the requests the backends log, and the drop counters in
+`pbctl stats` stay flat. `tx` counts `XDP_TX` verdicts: the program handed the frame back
+to the driver. A driver whose transmit ring is full drops the frame after that, where no
+PacketBalance counter can see it ([API.md](API.md), metrics).
+
+**1. Read the driver's XDP counters on the LB's interface.**
+
+```sh
+ethtool -S <if> | grep -i xdp_tx_errors         # the lab: ip netns exec lb1 ethtool -S veth0
+```
+
+On a veth the counters are per queue (`rx_queue_N_xdp_tx_errors`); sum them and compare
+the rate with the rate of `tx`. Physical NIC drivers name their equivalent differently
+(`ethtool -S <if> | grep -i xdp` lists what the driver has). A rising error count means
+the frames were lost at transmit.
+
+**2. On a veth, check the peer too.** The same drop shows as `rx_dropped` on the peer
+(in the lab, `pb-lb1` in the root namespace):
+
+```sh
+ip -s link show pb-lb1                         # RX dropped
+cat /sys/class/net/pb-lb1/statistics/rx_dropped
+```
+
+`xdp_tx_errors` on the LB veth, its `tx_dropped`, and the peer's `rx_dropped` rising
+together are one event counted three times. If instead the peer's `tx_dropped` rises,
+frames are being lost before the program runs (the LB veth's receive ring is full), which
+`pbctl stats` also cannot see.
+
+**3. Rule out the reals.** `ip -s link show veth0` on each real (`rx_dropped`) and the
+`softnet_stat` second column (`/proc/net/softnet_stat`) show frames that arrived but
+were dropped by a full receive backlog.
+
+**What to do.** On a veth this is the rings filling under load, not a PacketBalance fault:
+native XDP on veth runs on the sender's CPU and the rings hold 256 frames (README,
+Experiment 1). On a physical NIC, check that the driver has an XDP transmit queue per
+CPU (`ethtool -l <if>`) and that the NIC's transmit side is not saturated. In both
+cases, alert on the driver counter next to `tx`, not on `tx` alone.
 
 ## Diagnose: MTU black hole for large requests
 

@@ -104,3 +104,13 @@ Drops counted before the VIP is known (fragments, IP options, truncated headers,
 missing config) carry `vip="global"`. `pb_real_weight` is the configured weight, which
 a drain does not change. `pb_conntrack_entries` is the number of keys (flows) in the
 table, not per-CPU values, and costs an O(entries) walk per scrape.
+
+`tx` (`pb_tx_total`, and `tx` in `pbctl stats`) counts `XDP_TX` verdicts: packets the
+program encapsulated and handed back to the driver. It is not the number of frames the
+driver transmitted. A driver whose transmit ring is full drops the frame after the
+program returns, and the program cannot see that drop. On the lab's veth at saturation,
+`tx` read 2.6 times the packets that reached the reals (README, Experiment 1). The
+per-real `pb_real_packets_total` is counted at the same point and has the same meaning.
+Monitor the driver's own counter beside it: `ethtool -S <dev>`, `xdp_tx_errors` on veth
+(per queue, `rx_queue_N_xdp_tx_errors`), or the NIC driver's equivalent. See
+[RUNBOOK.md](RUNBOOK.md).

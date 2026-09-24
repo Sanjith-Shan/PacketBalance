@@ -5,17 +5,18 @@ packet rate measured in Experiment 1. The number this produces is less important
 the method. The measured inputs come from a VM, and the model says exactly where that
 makes them wrong.
 
-Values in double braces are measurements that are filled in from `results/` once
-Experiment 1 has run. Everything else is either arithmetic or a stated assumption.
+The measured values below are filled in from `results/` by `lab/fill_numbers.py --fill
+--basis received` (the template is `docs/templates/CAPACITY.md`). Everything else is
+either arithmetic or a stated assumption.
 
 ## Inputs
 
 | Symbol | Input | Value | Source |
 |---|---|---|---|
-| `P` | Forwarded packets per second per core, PacketBalance native XDP, 64-byte UDP, 10,000 flows | `{{EXP1_PPS_PER_CORE_NATIVE}}` | Experiment 1 |
+| `P` | Packets per second per core that arrived at the reals, PacketBalance native XDP, 64-byte UDP, 10,000 flows, lab VM on veth (mean of 3) | `{{EXP1_PPS_PER_CORE_NATIVE}}` | Experiment 1 |
 | `P_gen` | The same, generic XDP | `{{EXP1_PPS_PER_CORE_GENERIC}}` | Experiment 1 |
 | `P_ipvs` | The same, IPVS `mh` in DR mode | `{{IPVS_MH_PPS_PER_CORE}}` | Experiment 1 |
-| `t_prog` | XDP program run time per packet, from `bpftool prog show` with `kernel.bpf_stats_enabled=1` | `{{EXP1_BPF_NS_PER_PACKET}}` ns | Experiment 1 cross-check |
+| `t_prog` | XDP program run time per packet, from `bpftool prog show` with `kernel.bpf_stats_enabled=1` | not measured | Method only, see "Why the VM number is a lower bound" |
 | `T` | Target peak packet rate across the tier | 10 Mpps (the worked example) | Requirement |
 | `U` | Target utilization at peak, for CPU and for the link | 0.6 | Policy |
 | `S` | Packet size distribution at the load balancer | 64-byte frames, then a mix (below) | Assumption |
@@ -24,6 +25,14 @@ Experiment 1 has run. Everything else is either arithmetic or a stated assumptio
 | `r` | Cores reserved for the daemon (health checks, API, metrics), the OS and interrupts not tied to RX queues | 1 | Assumption |
 | `q` | NIC receive queues bound to cores | at least `c - r` | Assumption |
 | Redundancy | Hosts beyond what peak needs | N+2 | Policy |
+
+`P` counts packets received at the reals, not the program's `tx` counter. On the lab's
+veth, native XDP_TX verdicts outnumber delivered frames by about 2.6 to 1 because the
+veth driver drops frames the program has already transmitted (README, Experiment 1). A
+capacity model must be built on what arrives. Each `P` charges the whole VM's busy CPU
+(generator, bridge and reals included) to the load balancer, so it is an estimate and a
+lower bound. In this VM native XDP is the slowest of the three, for reasons specific to
+veth (below).
 
 **Why 60%.** Headroom for traffic spikes inside the measurement interval, for the extra
 load when a peer fails and ECMP moves its share (the N+2 covers whole-host loss, the 60%
@@ -76,19 +85,32 @@ cores_fwd = 15
 H_cpu     = 15 * P * 0.6                    = 9 * P
 H_link    = 25e9 * 0.6 / (8 * 104)          = 18.03 Mpps
 H         = min(9 * P, 18.03 Mpps)
-hosts     = ceil(10 Mpps / min(9 * {{EXP1_PPS_PER_CORE_NATIVE}}, 18.03 Mpps)) + 2
+hosts     = ceil(10 Mpps / min(9 * P, 18.03 Mpps)) + 2
 ```
 
 The host is CPU bound whenever `P` is below 18.03 / 9 = 2.0 Mpps per core, and link
 bound above it.
 
-The same formula for the baselines, which is the comparison that matters to someone
-deciding what to run:
+With the lab's measured per-core rates (received basis, means of three windows, rounded
+to the nearest thousand; the filled table above has the current values):
 
 ```
-hosts_generic = ceil(10 Mpps / min(9 * {{EXP1_PPS_PER_CORE_GENERIC}}, 18.03 Mpps)) + 2
-hosts_ipvs    = ceil(10 Mpps / min(9 * {{IPVS_MH_PPS_PER_CORE}}, 18.03 Mpps)) + 2
+native  P      = 142 kpps   H = 9 * 0.142 = 1.28 Mpps   hosts = ceil(10 / 1.28) + 2 = 8 + 2 = 10
+generic P_gen  = 343 kpps   H = 9 * 0.343 = 3.09 Mpps   hosts = ceil(10 / 3.09) + 2 = 4 + 2 = 6
+IPVS mh P_ipvs = 544 kpps   H = 9 * 0.544 = 4.90 Mpps   hosts = ceil(10 / 4.90) + 2 = 3 + 2 = 5
 ```
+
+Read literally, the VM says native XDP needs twice the hosts IPVS does. That is not a
+prediction for a physical tier, and the reason is the point of this document. In the VM,
+native XDP on veth runs in a NAPI poll on the generator's own CPU and loses most of its
+packets in the veth driver's 256-slot rings before and after the program (README,
+Experiment 1, packet accounting), while two of the six vCPUs stay idle. Behind a
+multi-queue NIC the program runs on the driver's receive ring on the IRQ CPUs, and
+XDP_TX goes to the NIC's own transmit ring. The veth losses have no equivalent there. So
+the method is what carries over: measure `P` on the target hardware, as packets that
+arrived, then apply the formula. The lab numbers show the arithmetic working, and they
+show that a per-core figure taken from a program's own counters, or from a VM, can be
+wrong by a factor that decides the hardware bill.
 
 To show how the answer responds to `P`, here is the arithmetic for a range of inputs.
 **These are inputs to the formula, not measurements of PacketBalance.**
@@ -166,10 +188,10 @@ not a per-CPU count.
 | 1,048,576 (1M, default) | 184 MiB | 344 MiB | 600 MiB | 1,112 MiB |
 | 8,388,608 (8M) | 1,472 MiB | 2,752 MiB | 4,800 MiB | 8,896 MiB |
 
-These are derived from the struct layout and should be checked against the kernel's own
-accounting with `bpftool map show pinned /sys/fs/bpf/packetbalance/conntrack`, whose
-`memlock` field is the charged size. The measured value for 1M entries on the lab VM
-is `{{CT_MEMLOCK_BYTES_1M}}` bytes.
+These are derived from the struct layout. The check is the kernel's own accounting,
+`bpftool map show pinned <pin path>/conntrack`, whose `memlock` field is the charged
+size. That check was not run: no result row records `memlock`, so the table above is
+arithmetic, not measurement.
 
 Two things follow. First, the per-CPU value term dominates on large hosts, and most of it
 is wasted. Each flow is normally processed on one CPU (RSS), so of the `C` value copies
@@ -190,9 +212,13 @@ last packet. An undersized table does not fail loudly. Evicted flows fall back t
 ring and survive unless the ring changes, so the failure appears only as extra broken
 connections during backend churn. Experiment 6 measures the other side of the trade,
 whether a larger table costs forwarding rate (Katran found hashing can be cheaper than
-the lookup). Per-core rates at 64K, 1M and 8M entries and with conntrack off are
-`{{EXP6_PPS_PER_CORE_64K}}`, `{{EXP6_PPS_PER_CORE_1M}}`, `{{EXP6_PPS_PER_CORE_8M}}` and
-`{{EXP6_PPS_PER_CORE_NO_CONNTRACK}}`.
+the lookup). Per-core rates (received basis, native XDP only) at 64K, 1M and 8M entries
+and with conntrack off are `{{EXP6_PPS_PER_CORE_64K}}`, `{{EXP6_PPS_PER_CORE_1M}}`,
+`{{EXP6_PPS_PER_CORE_8M}}` and `{{EXP6_PPS_PER_CORE_NO_CONNTRACK}}`. The direction is
+consistent with Katran's observation (the table costs measurable rate), but the repeats
+spread 30 to 40% at the large sizes and the 1M row disagrees with Experiment 1's identical
+configuration, so the sizes are not ranked against each other here. Generic mode is not
+included.
 
 The rings are small by comparison. Each VIP's ring is 65,537 × 4 bytes = 256 KiB, so 64
 VIPs are 16 MiB.
@@ -213,8 +239,14 @@ PacketBalance in native mode on a real NIC avoids several costs the lab pays.
   and the VM has no dedicated cores.
 - **RSS across real queues.** A multi-queue NIC hashes flows to queues in hardware, each
   served by its own core with no contention. In the VM, where the program runs is decided
-  by where the sending side schedules the veth's NAPI, which is often the generator's own
-  CPU.
+  by where the sending side schedules the veth's NAPI, which is the generator's own CPU:
+  in Experiment 1, CPUs 4 and 5 stayed idle while the generator's CPUs saturated.
+- **No veth rings.** Native XDP on veth has a 256-slot ring in front of the program and
+  another between XDP_TX and the peer. In a 30 s window at saturation in the lab, about
+  100 M of 141 M offered frames were dropped before the program ran and about 21 M of its
+  40.5 M XDP_TX verdicts were dropped handing them to the peer (`xdp_tx_errors`). That is why native XDP delivered
+  less than IPVS in this VM (582 kpps against 2.21 Mpps), and it is a property of the
+  veth driver, not of XDP on a NIC.
 - **No generator on the same cores.** pktgen and the load balancer compete for the same
   six vCPUs. Every cycle pktgen spends is a cycle the load balancer cannot. Attributing
   CPU time to the load balancer rather than the generator is the hardest part of the
@@ -238,10 +270,11 @@ Where the VM number could overstate a real host:
 
 So the lab number is a lower bound on the data plane's own cost per packet and a floor
 for the forwarding rate of the program, not a prediction of a production host.
-`t_prog` (the program's measured run time per packet) gives a program-only ceiling of
-`1e9 / t_prog` packets per second per core, which brackets the measurement from the other
-side. No number here is compared with Katran's published production figures, and none
-should be.
+The way to bracket the measurement from the other side is `t_prog`, the program's own
+run time per packet (`kernel.bpf_stats_enabled=1`, then `run_time_ns / run_cnt` from
+`bpftool prog show`), which gives a program-only ceiling of `1e9 / t_prog` packets per
+second per core. It was not measured in this lab, so no such ceiling is quoted. No number
+here is compared with Katran's published production figures, and none should be.
 
 ## Assumptions, stated once
 

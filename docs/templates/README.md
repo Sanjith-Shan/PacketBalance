@@ -39,7 +39,9 @@ template plus numbers, so an edit made only in the filled copy is lost on the ne
 `--basis received` switches every pps-per-core figure from forwarded packets to packets
 that arrived at the reals. Use it when `--check` reports a large gap between the two.
 
-The quantities that cannot come from the current rows are `EXP1_BPF_NS_PER_PACKET`
-(needs a `bpf_ns_per_packet` field from `bpftool prog show` with
-`kernel.bpf_stats_enabled=1`) and `CT_MEMLOCK_BYTES_1M` (needs a `*memlock*` field from
-`bpftool map show` on a 1M-entry run). Until a row carries them they stay as placeholders.
+Two quantities have no rows: the XDP program's run time per packet (`bpf_ns_per_packet`,
+from `bpftool prog show` with `kernel.bpf_stats_enabled=1`) and the connection table's
+charged memory at 1M entries (`memlock`, from `bpftool map show`). `fill_numbers.py` still
+knows them as `EXP1_BPF_NS_PER_PACKET` and `CT_MEMLOCK_BYTES_1M`, but the CAPACITY template
+no longer uses them: it describes the method and says they were not measured. If a later
+run records them, put the placeholders back in the template.
