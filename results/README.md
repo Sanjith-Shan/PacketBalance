@@ -17,6 +17,21 @@ commit message, never "corrected".
 | `exp5_hash_quality.json` | 5, hash quality (one JSON document) | `tools/hashquality` |
 | `exp6_conntrack.jsonl` | 6, cost of the connection table | `lab/measure.sh` via `experiments.sh exp6` |
 
+## What each `lb` label means
+
+| `lb` | Forwarding plane in lb1 (and lb2 for Exp 4) | Packet to the real |
+|---|---|---|
+| `packetbalance` | the XDP program, `xdp_mode` says native or generic; `hash` maglev or modulo; `conntrack` on or off | IPIP, outer source from 10.99.0.0/24 by flow hash |
+| `ipvs-mh` | IPVS, `mh` scheduler (Maglev inside IPVS) with `-b mh-port`, direct routing `-g`. The spec's fair baseline | original packet, destination MAC rewritten |
+| `ipvs-rr` | IPVS, round robin, direct routing `-g` | original packet, destination MAC rewritten |
+| `ipvs-mh-tun` | IPVS, `mh` with `-b mh-port`, tunneling `-i` | IPIP, outer source = the director's address. Like for like with PacketBalance: same 20 extra bytes, same decap on the real |
+| `none` | nothing: the client sends straight to real1 (Exp 1: pktgen to 10.0.0.21; Exp 2: wrk to http://10.0.0.21/) | original packet. The ceiling of the VM's virtual network |
+
+DR only rewrites the MAC, so the `-g` rows do slightly less work per packet
+than PacketBalance, which encapsulates; the `ipvs-mh-tun` row removes that
+difference. The `-g` rows stay because they are the spec's baseline and how
+IPVS is usually deployed.
+
 ## Fields on every row
 
 | Field | Meaning |
@@ -24,7 +39,7 @@ commit message, never "corrected".
 | `experiment` | `exp1`, `exp1_sweep`, `exp2`, `exp3`, `exp4`, `exp6` |
 | `host` | from `lab/host.env`, e.g. `Apple M3 Pro via Lima vz`. A VM, always |
 | `cpus`, `kernel`, `arch` | `os.cpu_count()`, `uname -r`, `uname -m` inside the VM |
-| `lb` | `packetbalance`, `ipvs-mh`, `ipvs-rr`, or `none` (client straight to real1) |
+| `lb` | which forwarding plane, see the label table below |
 | `config` | the harness's label for the configuration (Exp 2 to 4) |
 | `xdp_mode` | `native` or `generic` for PacketBalance, `null` otherwise |
 | `hash` | `maglev` or `modulo` for PacketBalance, `mh`/`rr` for IPVS, `null` for none |

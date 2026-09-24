@@ -23,7 +23,9 @@ options (each overrides the config file):
   --xdp-mode MODE         native | generic | auto (auto: native, else generic)
   --hash MODE             maglev | modulo (modulo is the naive baseline)
   --no-conntrack          never consult the connection table (hash every packet)
-  --conntrack-size N      connection-table entries per CPU, fixed at map creation
+  --conntrack-size N      connection-table size: total flows (keys) across all CPUs,
+                          fixed when the map is created
+  --icmp-pmtu             forward ICMP "fragmentation needed" to the real owning the flow
   --socket PATH           control socket (default /run/packetbalance.sock)
   --pin-path DIR          bpffs directory for pinned maps (default /sys/fs/bpf/packetbalance)
   --metrics-listen A:P    Prometheus endpoint (default 127.0.0.1:9101)
@@ -49,7 +51,7 @@ The config is re-read on the `reload` API command (pbctl reload).
 
 enum Flag {
     kConfig = 256, kInterface, kXdpMode, kHash, kNoConntrack, kConntrackSize, kSocket, kPinPath,
-    kMetricsListen, kNoHealthCheck, kRecreateMaps, kDetachOnExit, kLogLevel,
+    kMetricsListen, kNoHealthCheck, kRecreateMaps, kDetachOnExit, kLogLevel, kIcmpPmtu,
 };
 
 [[noreturn]] void usage_error(const std::string& msg) {
@@ -64,6 +66,7 @@ void Options::apply_to(Config& cfg) const {
     if (xdp_mode) cfg.xdp_mode = *xdp_mode;
     if (hash) cfg.hash = *hash;
     if (no_conntrack) cfg.conntrack_enabled = false;
+    if (icmp_pmtu) cfg.icmp_pmtu = true;
     if (conntrack_size) cfg.conntrack_size = *conntrack_size;
     if (socket) cfg.socket = *socket;
     if (pin_path) cfg.pin_path = *pin_path;
@@ -78,6 +81,7 @@ Options parse_options(int argc, char** argv) {
         {"xdp-mode", required_argument, nullptr, kXdpMode},
         {"hash", required_argument, nullptr, kHash},
         {"no-conntrack", no_argument, nullptr, kNoConntrack},
+        {"icmp-pmtu", no_argument, nullptr, kIcmpPmtu},
         {"conntrack-size", required_argument, nullptr, kConntrackSize},
         {"socket", required_argument, nullptr, kSocket},
         {"pin-path", required_argument, nullptr, kPinPath},
@@ -101,6 +105,7 @@ Options parse_options(int argc, char** argv) {
                 case kXdpMode: o.xdp_mode = parse_xdp_mode(arg); break;
                 case kHash: o.hash = parse_hash_mode(arg); break;
                 case kNoConntrack: o.no_conntrack = true; break;
+                case kIcmpPmtu: o.icmp_pmtu = true; break;
                 case kConntrackSize: {
                     const unsigned long n = std::stoul(arg);
                     if (n == 0 || n > (1ul << 27)) throw std::invalid_argument("out of range");

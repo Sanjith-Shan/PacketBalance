@@ -62,7 +62,13 @@ struct Config {
     Cidr encap_src{};                   // required
     std::optional<uint32_t> next_hop_be;
     bool conntrack_enabled = true;
+    // Total number of keys (flows) the LRU_PERCPU_HASH can hold, fixed when
+    // the map is created. Not per CPU: each key carries one value per CPU,
+    // but the key budget is shared.
     uint32_t conntrack_size = PB_CT_DEFAULT_SIZE;
+    // Forward ICMP "fragmentation needed" to the real that owns the inner
+    // flow (PB_CFG_F_ICMP_PMTU). Optional `icmp_pmtu: true`, or --icmp-pmtu.
+    bool icmp_pmtu = false;
     std::string socket = "/run/packetbalance.sock";
     std::string pin_path = PB_PIN_DIR;
     std::string metrics_listen = "127.0.0.1:9101";

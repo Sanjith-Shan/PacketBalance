@@ -73,7 +73,9 @@ def config_label(r):
             parts.append("no conntrack")
         return " ".join(parts)
     if lb.startswith("ipvs"):
-        return "IPVS %s (DR)" % lb.split("-", 1)[1]
+        parts = lb.split("-")
+        mode = "IPIP tunnel" if parts[-1] == "tun" else "DR"
+        return "IPVS %s (%s)" % (parts[1], mode)
     if lb == "none":
         return "no LB (direct to real1)"
     return lb
@@ -250,7 +252,7 @@ def exp6_table(rows):
            + provenance(rows), "",
            "| Connection table | n | Forwarded pps | Received pps | VM CPU busy % | pps per core (est.) | Notes |",
            "|---|---:|---:|---:|---:|---:|---|"]
-    key = lambda r: "off" if r.get("conntrack") is False else "%s entries/CPU" % format(r.get("conntrack_size") or 0, ",")
+    key = lambda r: "off" if r.get("conntrack") is False else "%s flows (--conntrack-size)" % format(r.get("conntrack_size") or 0, ",")
     for label, rs in group(rows, key).items():
         ok = [r for r in rs if r.get("forwarded_pps") is not None]
         notes = "" if ok else (rs[0].get("notes") or "")[:120]

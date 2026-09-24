@@ -188,7 +188,8 @@ Config parse_config(const std::string& yaml_text) {
         throw std::runtime_error(std::string("config: YAML syntax: ") + e.what());
     }
     check_keys(root, "", {"interface", "xdp_mode", "hash", "encap_src_prefix", "next_hop",
-                          "conntrack", "socket", "pin_path", "metrics", "health_check", "vips"});
+                          "icmp_pmtu", "conntrack", "socket", "pin_path", "metrics", "health_check",
+                          "vips"});
 
     Config c;
     c.interface = require<std::string>(root, "interface", "");
@@ -201,6 +202,8 @@ Config parse_config(const std::string& yaml_text) {
     });
     if (root["next_hop"] && !root["next_hop"].IsNull())
         c.next_hop_be = with_key("next_hop", [&] { return parse_ipv4(root["next_hop"].as<std::string>()); });
+
+    c.icmp_pmtu = get<bool>(root, "icmp_pmtu", "", false);
 
     if (const YAML::Node ct = root["conntrack"]) {
         check_keys(ct, "conntrack.", {"enabled", "size"});

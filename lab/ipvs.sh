@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # IPVS baseline in direct-routing mode (-g, IPVS's DSR) inside an LB namespace.
 #
-#   lab/ipvs.sh <lb1|lb2> up   {rr|mh|wrr}     VIP 198.51.100.1: 80/tcp, 5000/udp, 7000/tcp
+#   lab/ipvs.sh <lb1|lb2> up   {rr|mh|wrr} [dr|tun]   VIP 198.51.100.1: 80/tcp, 5000/udp, 7000/tcp
 #   lab/ipvs.sh <lb1|lb2> down
 #   lab/ipvs.sh <lb1|lb2> del  <real-ip>       remove a real from every service (Exp 3)
 #   lab/ipvs.sh <lb1|lb2> add  <real-ip>       add it back
@@ -9,6 +9,13 @@
 #
 # Env: IPVS_REALS="10.0.0.21 10.0.0.22 10.0.0.23 10.0.0.24" (default)
 #      IPVS_SLOPPY_TCP=1 (default 1, see below)
+#
+# Forwarding mode: dr (default, -g) rewrites only the destination MAC, the
+# spec's baseline. tun (-i) encapsulates in IPIP to the real, like PacketBalance
+# does (the reals' tunl0 decapsulates it), so an "ipvs-mh-tun" row is the
+# like-for-like comparison: same extra 20 bytes and the same decap work on the
+# reals. The outer source is the director's own address (10.0.0.2/3), unlike
+# PacketBalance's per-flow encap source.
 #
 # Notes that matter for the comparison with PacketBalance:
 #  * DR rewrites only the destination MAC, so the director must own the VIP
@@ -36,16 +43,24 @@ set -euo pipefail
 source "$(dirname "$0")/common.sh"
 need_root
 
-ns=${1:-}; action=${2:-}; arg=${3:-}
+ns=${1:-}; action=${2:-}; arg=${3:-}; fwd_mode=${4:-${IPVS_FWD:-dr}}
 [[ $ns == lb1 || $ns == lb2 ]] || die "usage: $0 <lb1|lb2> {up rr|mh|wrr | down | del IP | add IP | status}"
 read -r -a reals <<<"${IPVS_REALS:-${DEFAULT_REALS[*]}}"
 services=("-t $VIP:80" "-u $VIP:5000" "-t $VIP:7000")
 
+# The forwarding mode of an existing service is remembered in $RUN so a later
+# `add` (Exp 3) re-adds the real the same way.
+fwd_flag() {
+    local m=$fwd_mode
+    [[ $action == add ]] && m=$(cat "$RUN/ipvs-$ns.fwd" 2>/dev/null || echo dr)
+    case $m in dr) echo -g ;; tun) echo -i ;; *) die "forwarding mode must be dr or tun" ;; esac
+}
 add_real() {  # add_real <real-ip>
-    local svc
+    local svc flag
+    flag=$(fwd_flag)
     for svc in "${services[@]}"; do
         # shellcheck disable=SC2086
-        nsx "$ns" ipvsadm -a $svc -r "$1" -g -w 1
+        nsx "$ns" ipvsadm -a $svc -r "$1" "$flag" -w 1
     done
 }
 
@@ -63,13 +78,16 @@ up)
         # shellcheck disable=SC2086
         nsx "$ns" ipvsadm -A $svc -s "$sched" "${flags[@]}"
     done
+    fwd_flag >/dev/null
     for r in "${reals[@]}"; do add_real "$r"; done
+    mkdir -p "$RUN"; echo "$fwd_mode" >"$RUN/ipvs-$ns.fwd"
     nsx "$ns" ip addr replace "$VIP/32" dev lo
-    log "ipvs up in $ns: sched=$sched ${flags[*]} reals=${reals[*]} sloppy_tcp=${IPVS_SLOPPY_TCP:-1}"
+    log "ipvs up in $ns: sched=$sched fwd=$fwd_mode ${flags[*]} reals=${reals[*]} sloppy_tcp=${IPVS_SLOPPY_TCP:-1}"
     ;;
 down)
     nsx "$ns" ipvsadm -C 2>/dev/null || true
     nsx "$ns" ip addr del "$VIP/32" dev lo 2>/dev/null || true
+    rm -f "$RUN/ipvs-$ns.fwd"
     log "ipvs down in $ns"
     ;;
 del)

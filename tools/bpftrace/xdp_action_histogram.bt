@@ -1,0 +1,77 @@
+#!/usr/bin/env bpftrace
+/*
+ * xdp_action_histogram.bt  Count the verdicts of the PacketBalance XDP program.
+ *
+ *   sudo bpftrace tools/bpftrace/xdp_action_histogram.bt [interval_s]
+ *
+ * Prints, every interval (default 5 s), how many packets the program returned
+ * each XDP action for, and resets.
+ *
+ * How it sees the verdict depends on the attach mode, because bpftrace 0.20
+ * (Ubuntu 24.04) cannot put an fexit probe on a BPF program itself:
+ *
+ *   xdpgeneric  exact. fexit on bpf_prog_run_generic_xdp(), which runs the
+ *               program on the skb and returns its action. Filtered to our
+ *               program by name, so other XDP programs on the box do not count.
+ *   xdpdrv      partial. The driver calls the program inline. What is still
+ *               visible: xdp:xdp_bulk_tx (XDP_TX batches flushed by the driver,
+ *               with how many were sent and how many the TX ring dropped) and
+ *               xdp:xdp_exception (XDP_ABORTED, or an action the driver
+ *               refused). For DROP/PASS per reason in native mode read
+ *               `pbctl stats` (the program's own counters) or `ethtool -S`.
+ */
+
+BEGIN
+{
+	@name[0] = "XDP_ABORTED";
+	@name[1] = "XDP_DROP";
+	@name[2] = "XDP_PASS";
+	@name[3] = "XDP_TX";
+	@name[4] = "XDP_REDIRECT";
+	@interval = $1 > 0 ? $1 : 5;
+	printf("xdp_packetbalance verdicts every %d s. Ctrl-C to stop.\n", @interval);
+}
+
+fexit:vmlinux:bpf_prog_run_generic_xdp
+/ strncmp(args->xdp_prog->aux->name, "xdp_packetbal", 13) == 0 /
+{
+	@generic[@name[retval]] = count();
+}
+
+tracepoint:xdp:xdp_bulk_tx
+{
+	@native_tx_sent[args->ifindex] = sum(args->sent);
+	@native_tx_ring_drops[args->ifindex] = sum(args->drops);
+}
+
+// Keyed (prog_id, act, ifindex), all numeric: 0 ABORTED, 1 DROP, 2 PASS,
+// 3 TX, 4 REDIRECT. bpftrace 0.20 emits a misaligned stack store, which the
+// verifier rejects, for a tuple key that mixes these ints with a string.
+tracepoint:xdp:xdp_exception
+{
+	@exception[args->prog_id, args->act, args->ifindex] = count();
+}
+
+interval:s:1
+{
+	@ticks++;
+	if (@ticks >= @interval) {
+		time("%H:%M:%S\n");
+		print(@generic);
+		print(@native_tx_sent);
+		print(@native_tx_ring_drops);
+		print(@exception);
+		clear(@generic);
+		clear(@native_tx_sent);
+		clear(@native_tx_ring_drops);
+		clear(@exception);
+		@ticks = 0;
+	}
+}
+
+END
+{
+	clear(@name);
+	clear(@interval);
+	clear(@ticks);
+}

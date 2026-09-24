@@ -58,6 +58,7 @@ TEST(Config, MinimalUsesDefaults) {
     EXPECT_EQ(c.pin_path, PB_PIN_DIR);
     EXPECT_EQ(c.metrics_listen, "127.0.0.1:9101");
     EXPECT_FALSE(c.next_hop_be.has_value());
+    EXPECT_FALSE(c.icmp_pmtu);
     EXPECT_EQ(c.health.fall, 3u);
     EXPECT_EQ(c.health.rise, 2u);
     ASSERT_EQ(c.vips.size(), 1u);
@@ -89,6 +90,7 @@ xdp_mode: generic
 hash: modulo
 encap_src_prefix: 10.99.0.0/16
 next_hop: 10.0.0.1
+icmp_pmtu: true
 conntrack: { enabled: false, size: 65536 }
 socket: /tmp/pb.sock
 pin_path: /sys/fs/bpf/pbtest
@@ -101,6 +103,7 @@ vips: []
     EXPECT_EQ(pb::ipv4_to_string(c.encap_src.mask_be), "255.255.0.0");
     ASSERT_TRUE(c.next_hop_be.has_value());
     EXPECT_EQ(pb::ipv4_to_string(*c.next_hop_be), "10.0.0.1");
+    EXPECT_TRUE(c.icmp_pmtu);
     EXPECT_FALSE(c.conntrack_enabled);
     EXPECT_EQ(c.conntrack_size, 65536u);
     EXPECT_EQ(c.socket, "/tmp/pb.sock");
@@ -125,6 +128,7 @@ TEST(Config, RejectsSchemaErrors) {
     expect_error("interface: eth0\n", "`encap_src_prefix` is required");
     expect_error(base + "conntrak: { size: 5 }\n", "unknown key `conntrak`");
     expect_error(base + "xdp_mode: offload\n", "xdp_mode");
+    expect_error(base + "icmp_pmtu: maybe\n", "icmp_pmtu");
     expect_error(base + "hash: rendezvous\n", "hash");
     expect_error(base + "vips: [{address: 1.2.3.4, port: 80, proto: sctp}]\n", "tcp or udp");
     expect_error(base + "vips: [{address: 1.2.3.4, port: 0, proto: tcp}]\n", "port` out of range");

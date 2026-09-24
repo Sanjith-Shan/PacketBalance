@@ -1,0 +1,51 @@
+#!/usr/bin/env bpftrace
+/*
+ * xdp_adjust_head.bt  Watch bpf_xdp_adjust_head(), the helper that makes room
+ * for the outer IPv4 header. Every forwarded packet calls it exactly once, so
+ * the call rate is the encapsulation rate, and any non-zero return is a
+ * packet the program drops as PB_CNT_DROP_ADJ_HEAD.
+ *
+ *   sudo bpftrace tools/bpftrace/xdp_adjust_head.bt
+ *
+ * Failure means the driver did not reserve enough headroom in front of the
+ * frame (-EINVAL). Seen with drivers or modes that give less than the usual
+ * 256 bytes of XDP headroom. The per-CPU split shows whether all RX queues
+ * are affected or one.
+ *
+ * Works in every mode (generic, native, BPF_PROG_TEST_RUN) because the JIT
+ * calls the helper as an ordinary kernel function.
+ */
+
+kprobe:bpf_xdp_adjust_head
+{
+	@delta[(int32)arg1] = count();
+}
+
+kretprobe:bpf_xdp_adjust_head
+{
+	@calls_per_cpu[cpu] = count();
+	if ((int32)retval != 0) {
+		@failures[cpu, (int32)retval] = count();
+		printf("%s adjust_head failed on cpu %d: %d\n",
+		       strftime("%H:%M:%S", nsecs), cpu, (int32)retval);
+	}
+}
+
+interval:s:5
+{
+	time("%H:%M:%S ");
+	printf("adjust_head calls in the last 5 s, by cpu:\n");
+	print(@calls_per_cpu);
+	clear(@calls_per_cpu);
+}
+
+END
+{
+	printf("\nrequested head delta (bytes, -20 = one outer IPv4 header):\n");
+	print(@delta);
+	printf("failures by (cpu, errno):\n");
+	print(@failures);
+	clear(@delta);
+	clear(@failures);
+	clear(@calls_per_cpu);
+}

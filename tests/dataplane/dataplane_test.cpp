@@ -40,6 +40,7 @@ constexpr int kXdpTx = 3;
 
 constexpr uint8_t kTcpFin = 0x01;
 constexpr uint8_t kTcpSyn = 0x02;
+constexpr uint8_t kTcpRst = 0x04;
 constexpr uint8_t kTcpAck = 0x10;
 
 constexpr const char* kSkipMsg = "dataplane tests need root";
@@ -178,6 +179,8 @@ class Dataplane : public ::testing::Test {
 protected:
     packetbalance_bpf* skel_ = nullptr;
     int ncpu_ = 0;
+    cpu_set_t saved_affinity_{};
+    bool pinned_ = false;
 
     void SetUp() override
     {
@@ -185,6 +188,24 @@ protected:
             GTEST_SKIP() << kSkipMsg << " (not running as root)";
         ncpu_ = libbpf_num_possible_cpus();
         ASSERT_GT(ncpu_, 0);
+
+        // BPF_PROG_TEST_RUN runs the program on the calling CPU, and the
+        // connection table is per-CPU: an entry written while this thread ran
+        // on CPU 2 is invisible (a zero-filled value) when the next packet is
+        // run on CPU 4. Pin the test to one CPU so "same flow, next packet"
+        // means what it means on a NIC RX queue. Without this the conntrack
+        // tests flaked whenever the scheduler migrated the thread.
+        ASSERT_EQ(sched_getaffinity(0, sizeof(saved_affinity_), &saved_affinity_), 0);
+        for (int c = 0; c < CPU_SETSIZE; c++) {
+            if (CPU_ISSET(c, &saved_affinity_)) {
+                cpu_set_t one;
+                CPU_ZERO(&one);
+                CPU_SET(c, &one);
+                ASSERT_EQ(sched_setaffinity(0, sizeof(one), &one), 0);
+                pinned_ = true;
+                break;
+            }
+        }
 
         skel_ = packetbalance_bpf__open();
         if (!skel_) {
@@ -218,6 +239,8 @@ protected:
     {
         if (skel_)
             packetbalance_bpf__destroy(skel_);
+        if (pinned_)
+            sched_setaffinity(0, sizeof(saved_affinity_), &saved_affinity_);
     }
 
     int fd(bpf_map* m) { return bpf_map__fd(m); }
@@ -556,6 +579,25 @@ TEST_F(Dataplane, TcpMidFlowMissHashesAndInserts)
     EXPECT_EQ(counter(kTcpVipId, PB_CNT_CT_HIT), 1u);
 }
 
+TEST_F(Dataplane, RstForUnknownFlowForwardedWithoutState)
+{
+    set_ring_all(kTcpVipId, kRealA);
+    auto rst = tcp_frame(kClient, 40009, kVip, 80, kTcpRst | kTcpAck);
+    expect_encap(rst, run(rst), kRealA);
+    EXPECT_EQ(counter(kTcpVipId, PB_CNT_CT_MISS), 1u);
+    EXPECT_EQ(counter(kTcpVipId, PB_CNT_HASH), 1u);
+    EXPECT_EQ(ct_real(kClient, 40009, kVip, 80, IPPROTO_TCP), PB_REAL_NONE)
+        << "a RST that misses must not create a conntrack entry";
+
+    // A RST on a known flow still follows the entry (and does not delete it).
+    auto syn = tcp_frame(kClient, 40010, kVip, 80, kTcpSyn);
+    expect_encap(syn, run(syn), kRealA);
+    set_ring_all(kTcpVipId, kRealB);
+    auto rst2 = tcp_frame(kClient, 40010, kVip, 80, kTcpRst);
+    expect_encap(rst2, run(rst2), kRealA);
+    EXPECT_EQ(ct_real(kClient, 40010, kVip, 80, IPPROTO_TCP), kRealA);
+}
+
 TEST_F(Dataplane, UdpFlowEncapsulatedAndTracked)
 {
     set_ring_all(kUdpVipId, kRealB);
@@ -712,9 +754,7 @@ TEST_F(Dataplane, UserspaceHashPredictsRingSlot)
 // CPU B must treat that as a miss (and hash), not as a hit on real_id 0.
 TEST_F(Dataplane, OtherCpuZeroValueIsAMissNotRealZero)
 {
-    cpu_set_t online;
-    CPU_ZERO(&online);
-    ASSERT_EQ(sched_getaffinity(0, sizeof(online), &online), 0);
+    cpu_set_t online = saved_affinity_;
     if (CPU_COUNT(&online) < 2)
         GTEST_SKIP() << "needs two CPUs";
     int cpus[2], n = 0;
@@ -737,7 +777,6 @@ TEST_F(Dataplane, OtherCpuZeroValueIsAMissNotRealZero)
     ASSERT_EQ(pin(cpus[1]), 0);
     auto ack = tcp_frame(kClient, 42000, kVip, 80, kTcpAck);
     auto r = run(ack);
-    sched_setaffinity(0, sizeof(online), &online);
     expect_encap(ack, r, kRealA);   // hash, same ring: same real
     EXPECT_EQ(counter(kTcpVipId, PB_CNT_CT_MISS), 1u);
     EXPECT_EQ(counter(kTcpVipId, PB_CNT_CT_HIT), 0u);

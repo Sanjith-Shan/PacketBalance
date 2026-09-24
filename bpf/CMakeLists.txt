@@ -15,6 +15,13 @@ else()
   message(FATAL_ERROR "Unsupported BPF target arch: ${PB_UNAME_M}")
 endif()
 
+# clang -target bpf does not search the multiarch include directory, where
+# Debian/Ubuntu keep <asm/types.h> (pulled in by <linux/types.h>).
+set(PB_BPF_SYS_INCLUDES)
+if(CMAKE_LIBRARY_ARCHITECTURE AND EXISTS /usr/include/${CMAKE_LIBRARY_ARCHITECTURE})
+  list(APPEND PB_BPF_SYS_INCLUDES -idirafter /usr/include/${CMAKE_LIBRARY_ARCHITECTURE})
+endif()
+
 set(PB_BPF_SRC ${CMAKE_CURRENT_SOURCE_DIR}/packetbalance.bpf.c)
 set(PB_BPF_OBJ ${CMAKE_CURRENT_BINARY_DIR}/packetbalance.bpf.o)
 set(PB_BPF_SKEL ${CMAKE_CURRENT_BINARY_DIR}/packetbalance.skel.h)
@@ -23,7 +30,7 @@ add_custom_command(
   OUTPUT ${PB_BPF_OBJ}
   COMMAND ${PB_CLANG} -g -O2 -target bpf -D__TARGET_ARCH_${PB_BPF_ARCH}
           -Wall -Wextra -Werror
-          -I${CMAKE_SOURCE_DIR}/include
+          -I${CMAKE_SOURCE_DIR}/include ${PB_BPF_SYS_INCLUDES}
           -c ${PB_BPF_SRC} -o ${PB_BPF_OBJ}
   DEPENDS ${PB_BPF_SRC}
           ${CMAKE_SOURCE_DIR}/include/packetbalance/abi.h

@@ -11,7 +11,7 @@
 #   EXP1_RATES="..."   rates for the sweep, pps, 0 = unthrottled
 #   EXP_LBS="..."      only run these LB labels, e.g. "ipvs-mh ipvs-rr none".
 #                      Labels: packetbalance-native packetbalance-generic
-#                      packetbalance-noct packetbalance-modulo ipvs-mh ipvs-rr none
+#                      packetbalance-noct packetbalance-modulo ipvs-mh ipvs-rr ipvs-mh-tun none
 #   CONNS=10000        conncheck connections for Exp 3 and 4
 #   PB_XDP_MODE=native XDP mode for Exp 2, 3, 4, 6
 #   NOTES="..."        appended to every row's notes
@@ -103,10 +103,12 @@ setup_pb() {
     write_pb_config "$ns" "$hash" "$ct" "$ctsize" "$@" >/dev/null
     pb_start "$ns" "$mode" "${flags[@]}"
 }
-setup_ipvs() {  # setup_ipvs <ns> <sched> [extra reals...]
-    local ns=$1 sched=$2; shift 2
+setup_ipvs() {  # setup_ipvs <ns> <sched>[-tun] [extra reals...]
+    local ns=$1 sched=${2%-tun} fwd=dr
+    [[ $2 == *-tun ]] && fwd=tun
+    shift 2
     pb_stop "$ns"
-    IPVS_REALS="${DEFAULT_REALS[*]} $*" ipvs "$ns" up "$sched"
+    IPVS_REALS="${DEFAULT_REALS[*]} $*" ipvs "$ns" up "$sched" "$fwd"
 }
 
 # label -> "plane xdp_mode hash conntrack"
@@ -118,6 +120,7 @@ describe() {
         packetbalance-modulo)  echo "packetbalance $PB_XDP_MODE modulo true" ;;
         packetbalance)         echo "packetbalance $PB_XDP_MODE maglev true" ;;
         ipvs-mh)               echo "ipvs-mh n/a mh true" ;;
+        ipvs-mh-tun)           echo "ipvs-mh-tun n/a mh true" ;;
         ipvs-rr)               echo "ipvs-rr n/a rr true" ;;
         none)                  echo "none n/a n/a n/a" ;;
     esac
@@ -167,7 +170,7 @@ set_lf() { mapfile -t LF < <(label_fields "$1"); }
 # Experiment 1: packet rate at saturation
 # ===========================================================================
 exp1() {
-    local labels=(packetbalance-native packetbalance-generic ipvs-mh ipvs-rr none)
+    local labels=(packetbalance-native packetbalance-generic ipvs-mh ipvs-rr ipvs-mh-tun none)
     local rep label plane mode hash ct body
     for ((rep = 1; rep <= REPEATS; rep++)); do
         for label in "${labels[@]}"; do
@@ -209,7 +212,7 @@ exp1() {
 # Experiment 2: latency and throughput through the LB (wrk)
 # ===========================================================================
 exp2() {
-    local labels=(packetbalance ipvs-mh ipvs-rr none)
+    local labels=(packetbalance ipvs-mh ipvs-rr ipvs-mh-tun none)
     local rep label url out
     for ((rep = 1; rep <= REPEATS; rep++)); do
         for label in "${labels[@]}"; do
@@ -345,7 +348,7 @@ exp6() {
             if ! setup_pb lb1 "$PB_XDP_MODE" maglev "$ct" "$size"; then
                 append exp6_conntrack.jsonl experiment=exp6 lb=packetbalance "xdp_mode=$PB_XDP_MODE" hash=maglev \
                     "conntrack:=$ct" "conntrack_size:=$size" "repeat:=$rep" "forwarded_pps:=null" \
-                    "notes=daemon failed to start with this conntrack size (per-CPU LRU of $size entries x $(nproc) CPUs); $mem_note; log: $(tail -n 3 "$RUN/pb-lb1.log" 2>/dev/null | tr '\n' ' ' | tr -d '\"')"
+                    "notes=daemon failed to start with this conntrack size (LRU_PERCPU_HASH, --conntrack-size $size total flows, $(nproc) CPUs); $mem_note; log: $(tail -n 3 "$RUN/pb-lb1.log" 2>/dev/null | tr '\n' ' ' | tr -d '\"')"
                 continue
             fi
             body=$(check_vip)

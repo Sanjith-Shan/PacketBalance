@@ -141,6 +141,7 @@ json Daemon::config_json() const {
         {"hash", hash_mode_name(c.hash)},
         {"conntrack", {{"enabled", c.conntrack_enabled}, {"size", c.conntrack_size}}},
         {"encap_src_prefix", c.encap_src.str()},
+        {"icmp_pmtu", c.icmp_pmtu},
         {"next_hop", c.next_hop_be ? json(ipv4_to_string(*c.next_hop_be)) : json(nullptr)},
         {"socket", c.socket},
         {"pin_path", c.pin_path},

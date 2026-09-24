@@ -65,12 +65,13 @@ void LbState::write_config_map(const Config& cfg) {
     std::memcpy(c.lb_mac, mac.bytes.data(), 6);
     c.encap_src_prefix = cfg.encap_src.prefix_be;
     c.encap_src_mask = cfg.encap_src.mask_be;
-    c.flags = cfg.conntrack_enabled ? 0 : PB_CFG_F_NO_CONNTRACK;
+    c.flags = (cfg.conntrack_enabled ? 0 : PB_CFG_F_NO_CONNTRACK) | (cfg.icmp_pmtu ? PB_CFG_F_ICMP_PMTU : 0);
     const uint32_t zero = 0;
     if (int err = bpf_map_update_elem(fds_.config, &zero, &c, BPF_ANY))
         throw std::runtime_error("write config map: " + errstr(err));
-    log::info("config map: lb_mac={} encap_src={} conntrack={}", mac.str(), cfg.encap_src.str(),
-              cfg.conntrack_enabled ? "on" : "off (hash every packet)");
+    log::info("config map: lb_mac={} encap_src={} conntrack={} icmp_pmtu={}", mac.str(),
+              cfg.encap_src.str(), cfg.conntrack_enabled ? "on" : "off (hash every packet)",
+              cfg.icmp_pmtu ? "on" : "off");
 }
 
 void LbState::apply(const Config& cfg) {
@@ -300,6 +301,8 @@ void LbState::rebuild_locked(Vip& v, const char* reason) {
         active += m.in_ring;
         backends.push_back(Backend{*reals_.id_of(addr), addr, m.in_ring ? m.weight : 0});
     }
+    // build_ring throws on duplicate addresses; members are keyed by address,
+    // and both the config parser and real.add reject duplicates up front.
     install_ring(fds_.rings, v.id, build_ring(backends, hash_));
     ++v.generation;
     const double ms =

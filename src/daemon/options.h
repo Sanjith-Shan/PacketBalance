@@ -20,6 +20,7 @@ struct Options {
     std::optional<XdpMode> xdp_mode;
     std::optional<HashMode> hash;
     bool no_conntrack = false;
+    bool icmp_pmtu = false;
     std::optional<uint32_t> conntrack_size;
     std::optional<std::string> socket;
     std::optional<std::string> pin_path;

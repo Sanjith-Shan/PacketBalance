@@ -55,8 +55,10 @@ struct {
     __uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
     __uint(max_entries, PB_MAX_VIPS);
     __type(key, __u32);
-    __array(values, struct ring_map);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
+    // __array expands to a flexible array member, so it must be the last
+    // field of the map definition (clang rejects it anywhere else).
+    __array(values, struct ring_map);
 } rings SEC(".maps");
 
 struct {
@@ -182,8 +184,12 @@ static __always_inline __u32 ring_lookup(__u32 vip_id, __u32 hash)
 //
 //   use_ct     connection table enabled for this VIP and daemon-wide
 //   bare_syn   TCP SYN without ACK: a new connection, always hash
-//   may_insert write the result into the connection table (false for ICMP,
-//              which must not create state for a flow it is only about)
+//   may_insert write the result into the connection table on a miss. False
+//              for ICMP, which must not create state for a flow it is only
+//              about, and for a TCP RST: a RST for a flow this LB does not
+//              know (a stray, a scan, a reset after failover) is forwarded by
+//              hash but must not create an entry, or a flood of RSTs would
+//              fill the table with dead flows. Katran does the same.
 //
 // FIN and RST do not delete the entry. Katran does the same. Deleting buys
 // nothing, since the LRU evicts idle entries on its own when the table is
@@ -484,6 +490,15 @@ int xdp_packetbalance(struct xdp_md *ctx)
         return drop_global(PB_CNT_DROP_FRAG);
 
     __u32 tot_len = bpf_ntohs(iph->tot_len);
+    // The 6.8 verifier does not track bounds through the BPF byte-swap
+    // instruction (be16), so after bpf_ntohs() tot_len is an unbounded
+    // scalar and "iph + tot_len" is rejected ("math between pkt pointer and
+    // register with unbounded min value"). clang knows the result fits in
+    // 16 bits and would delete a plain "> 0xffff" check, so hide the value
+    // from the optimizer first and then bound it explicitly.
+    asm volatile("" : "+r"(tot_len));
+    if (tot_len > 0xffff)
+        return drop_global(PB_CNT_DROP_OTHER);
     // A header that claims more bytes than the frame carries is truncated.
     // Frames may be longer than tot_len (Ethernet minimum-size padding).
     if (tot_len < sizeof(*iph) || (void *)iph + tot_len > data_end)
@@ -500,6 +515,7 @@ int xdp_packetbalance(struct xdp_md *ctx)
         .proto = iph->protocol,
     };
     int bare_syn = 0;
+    int may_insert = 1;
 
     if (iph->protocol == IPPROTO_TCP) {
         struct tcphdr *th = (void *)(iph + 1);
@@ -508,6 +524,7 @@ int xdp_packetbalance(struct xdp_md *ctx)
         f.sport = th->source;
         f.dport = th->dest;
         bare_syn = th->syn && !th->ack;
+        may_insert = !th->rst;
     } else if (iph->protocol == IPPROTO_UDP) {
         struct udphdr *uh = (void *)(iph + 1);
         if ((void *)(uh + 1) > data_end)
@@ -529,5 +546,5 @@ int xdp_packetbalance(struct xdp_md *ctx)
     if (!vip)
         return pass_global();
 
-    return forward(ctx, &f, vip, cfg, bare_syn, 1, 0, tot_len, iph->tos);
+    return forward(ctx, &f, vip, cfg, bare_syn, may_insert, 0, tot_len, iph->tos);
 }
