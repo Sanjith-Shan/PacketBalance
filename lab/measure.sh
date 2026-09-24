@@ -25,6 +25,11 @@
 #                  the bridge and the reals, not only the LB. See results/README.md.
 #   pps_per_core   forwarded_pps / (lb_cpu_util/100 * ncpu), an estimate, and a
 #                  lower bound on the LB's own per-core rate for the same reason.
+#   pps_per_core_received  the same with received_pps (what arrived at the reals)
+#   pb_counters_delta / pb_drops_delta  packetbalance: every counter (global +
+#                  VIPs) over the window, and the nonzero drop reasons
+#   lb_veth_xdp_delta  the LB veth0's per-queue XDP stats summed (ethtool -S),
+#                  e.g. xdp_tx_errors = XDP_TX frames the peer ring refused
 set -euo pipefail
 # shellcheck source=lab/common.sh
 source "$(dirname "$0")/common.sh"
@@ -126,6 +131,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Contention guard (common.sh host_gate): wait for a quiet, fast VM before the
+# generator starts; the canary is taken again after the generator stops, and
+# every 10 s inside the window (informational: a loaded CPU slows it too).
+read -r quiet_wait canary0 < <(host_gate)
 udp_echo_signal STOP
 log "measure: $name lb=$lb xdp=$xdp_mode hash=$hash ct=$conntrack/$ct_size flows=$flows rate=$rate dur=${duration}s repeat=$repeat gen=$generator"
 if [[ $generator == pktgen ]]; then
@@ -139,20 +148,46 @@ gen_pid=$!
 sleep "$warmup"
 kill -0 "$gen_pid" 2>/dev/null || { cat "$RUN/pktgen.out" >&2; die "generator exited early"; }
 
+# Full counter snapshots at both ends of the window: PacketBalance's per-reason
+# counters (drops by reason must be on the row, not only tx) and the LB veth's
+# XDP statistics (xdp_tx_errors: frames the program XDP_TX'd that the peer's
+# ring refused; the program already counted them as tx).
+snap() {  # snap <tag>
+    if [[ $lb == packetbalance ]]; then pbctl_ns "$lbns" --json stats >"$RUN/pbstats.$1.json" 2>/dev/null || echo '{}' >"$RUN/pbstats.$1.json"
+    else echo '{}' >"$RUN/pbstats.$1.json"; fi
+    nsx "$lbns" ethtool -S veth0 >"$RUN/ethtool.$1.txt" 2>/dev/null || : >"$RUN/ethtool.$1.txt"
+}
+# Count seconds with a build running in the VM, and sample the canary.
+( n=0; cs=""
+  for ((i = 1; i <= duration; i++)); do
+      [[ $(vm_busy_procs) -gt 0 ]] && n=$((n + 1))
+      if ((i % 10 == 0 && i < duration)); then cs+="$(cpu_canary) "; else sleep 1; fi
+  done
+  echo "$n" >"$RUN/busy.out"; echo "$cs" >"$RUN/canary.out" ) &
+busy_pid=$!
+snap 0
 read -r f0 tf0 < <(sample_forwarded)
 t0=$(now); s0=$(read_sent); r0=$(reals_rx_sum veth0 "${REAL_NS[@]}"); u0=$(tun_rx_sum)
+# mpstat covers exactly the window: <duration> one-second samples, then the
+# "Average:" rows are used. The sample count is checked below.
 LC_ALL=C mpstat -P ALL 1 "$duration" >"$RUN/mpstat.out"
 t1=$(now); s1=$(read_sent); r1=$(reals_rx_sum veth0 "${REAL_NS[@]}"); u1=$(tun_rx_sum)
 read -r f1 tf1 < <(sample_forwarded)
+snap 1
+wait "$busy_pid" 2>/dev/null || true
+busy_s=$(cat "$RUN/busy.out" 2>/dev/null || echo null)
+canary_mid=$(cat "$RUN/canary.out" 2>/dev/null || true)
 cleanup
 trap - EXIT
+canary1=$(cpu_canary)
 
 out="$RESULTS/$name.jsonl"
 T0=$t0 T1=$t1 TF0=$tf0 TF1=$tf1 S0=$s0 S1=$s1 F0=$f0 F1=$f1 R0=$r0 R1=$r1 U0=$u0 U1=$u1 \
 LB=$lb XDP=$xdp_mode HASH=$hash CT=$conntrack CTSIZE=$ct_size FLOWS=$flows DUR=$duration \
 RATE=$rate REPEAT=$repeat EXPERIMENT=${experiment:-${name%%_*}} NOTES=$notes GEN=$generator \
-HOSTDESC=$LAB_HOST DST=$dst PKTSIZE=${PKT_SIZE:-60} THREADS=${PKTGEN_THREADS:-1} MPSTAT="$RUN/mpstat.out" \
-python3 - >>"$out" <<'PY'
+HOSTDESC=$LAB_HOST DST=$dst PKTSIZE=${PKT_SIZE:-60} THREADS=${PKTGEN_THREADS:-1} MPSTAT="$RUN/mpstat.out" RUNDIR=$RUN \
+QUIET_WAIT=$quiet_wait BUSY_S=$busy_s CANARY="$canary0 $canary1" CANARY_MID="$canary_mid" CANARY_MIN=$CANARY_MIN \
+python3 - >"$RUN/row.json" <<'PY'
 import datetime, json, os, platform
 e = os.environ
 win = float(e["T1"]) - float(e["T0"])
@@ -174,9 +209,43 @@ received = rate("R0", "R1")
 fwin = float(e["TF1"]) - float(e["TF0"])
 forwarded = None if lb == "none" else round((int(e["F1"]) - int(e["F0"])) / fwin, 1)
 basis = received if forwarded is None else forwarded
-ppc = None
+ppc = ppc_rx = None
 if util:
     ppc = round(basis / (util / 100.0 * ncpu), 1)
+    ppc_rx = round(received / (util / 100.0 * ncpu), 1)
+canary = [int(x) for x in e["CANARY"].split()]
+busy = None if e["BUSY_S"] == "null" else int(e["BUSY_S"])
+gate = "pass" if canary and min(canary) >= int(e["CANARY_MIN"]) and not busy else "fail"
+mpstat_samples = sum(1 for line in open(e["MPSTAT"])
+                     if len(line.split()) > 3 and line.split()[1] == "all" and line.split()[0] != "Average:")
+
+def pb_counters(path):
+    try:
+        r = json.load(open(os.path.join(e["RUNDIR"], path)))
+    except (OSError, ValueError):
+        return {}
+    tot = {}
+    for c in [r.get("global") or {}] + list((r.get("vips") or {}).values()):
+        for k, v in c.items():
+            tot[k] = tot.get(k, 0) + int(v)
+    return tot
+pb0, pb1 = pb_counters("pbstats.0.json"), pb_counters("pbstats.1.json")
+pb_delta = {k: pb1[k] - pb0.get(k, 0) for k in pb1} if pb1 else None
+pb_drops = {k: v for k, v in (pb_delta or {}).items() if k.startswith("drop") and v} if pb1 else None
+
+def ethtool(path):
+    tot = {}
+    try:
+        for line in open(os.path.join(e["RUNDIR"], path)):
+            k, _, v = line.strip().partition(": ")
+            if k.startswith("rx_queue_") and v.strip().isdigit():
+                name = k.split("_", 3)[3]          # rx_queue_3_xdp_tx -> xdp_tx
+                tot[name] = tot.get(name, 0) + int(v)
+    except OSError:
+        pass
+    return tot
+et0, et1 = ethtool("ethtool.0.txt"), ethtool("ethtool.1.txt")
+lb_veth_xdp = {k: et1[k] - et0.get(k, 0) for k in et1 if k.startswith("xdp")} or None
 def num(x):
     return None if x in ("null", "", "n/a") else int(x)
 def boolish(x):
@@ -210,10 +279,31 @@ row = {
     "per_cpu_util": per_cpu,
     "pps_per_core": ppc,
     "pps_per_core_basis": "received_pps" if forwarded is None else "forwarded_pps",
+    "pps_per_core_received": ppc_rx,
+    "mpstat_samples": mpstat_samples,
+    "pb_counters_delta": pb_delta,
+    "pb_drops_delta": pb_drops,
+    "lb_veth_xdp_delta": lb_veth_xdp,
+    "vm_build_seconds_in_window": busy,
+    "quiet_wait_s": int(e["QUIET_WAIT"]),
+    "cpu_canary": canary,
+    "cpu_canary_in_window": [int(x) for x in e["CANARY_MID"].split()],
+    "cpu_canary_min_required": int(e["CANARY_MIN"]),
+    "host_gate": gate,
     "date": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     "repeat": int(e["REPEAT"]),
     "notes": e["NOTES"],
 }
 print(json.dumps(row))
 PY
-tail -n1 "$out" >&2
+# A window that failed the host gate goes to results/rejected.jsonl (kept, not
+# hidden) and the exit status is 3 so the caller can retry it.
+if python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1]))["host_gate"] == "pass" else 1)' "$RUN/row.json"; then
+    cat "$RUN/row.json" >>"$out"
+    tail -n1 "$out" >&2
+else
+    python3 -c 'import json, sys; r = json.load(open(sys.argv[1])); r["rejected_from"] = sys.argv[2]; print(json.dumps(r))' \
+        "$RUN/row.json" "$name.jsonl" >>"$RESULTS/rejected.jsonl"
+    log "host gate FAILED (canary $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cpu_canary"])' "$RUN/row.json") < $CANARY_MIN or a build ran); row written to results/rejected.jsonl"
+    exit 3
+fi

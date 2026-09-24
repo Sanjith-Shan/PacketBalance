@@ -41,7 +41,7 @@ for ns in "${ALL_NS[@]}"; do
 done
 
 for dev in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -E '^pb-(client|lb[12]|real[1-5])$' || true); do
-    run ip link del "$dev"
+    run ip link del "$dev" 2>/dev/null || true   # the peer of a deleted netns veth may already be gone
 done
 if ip link show "$BR" >/dev/null 2>&1; then run ip link del "$BR"; fi
 for ns in "${LB_NS[@]}"; do

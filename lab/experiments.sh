@@ -2,7 +2,7 @@
 # Run the PacketBalance experiments from the spec and append JSON rows to
 # results/*.jsonl. Every configuration is run REPEATS times (default 3).
 #
-#   sudo lab/experiments.sh [exp1|exp2|exp3|exp4|exp6|all] ...
+#   sudo lab/experiments.sh [exp1|exp2|exp3|exp4|exp6|restart|all] ...
 #
 # Env:
 #   REPEATS=3          repeats per configuration
@@ -361,6 +361,54 @@ exp6() {
     all_lbs_off
 }
 
+# ===========================================================================
+# Daemon restart keeps flows: conncheck holds RESTART_CONNS connections through
+# lb1; the daemon (started WITHOUT --detach-on-exit) gets SIGTERM at t=10 s and
+# is started again at t=15 s. The XDP program and the pinned maps (connection
+# table included) outlive the process, so nothing should break.
+# ===========================================================================
+RESTART_CONNS=${RESTART_CONNS:-1000}
+pb_term() {  # pb_term <lbns>: SIGTERM the daemon and wait for it to exit; keep XDP and pins
+    local ns=$1 pid i
+    pid=$(cat "$RUN/pb-$ns.pid" 2>/dev/null || true)
+    [[ -n $pid ]] || { log "pb_term: no pid for $ns"; return 1; }
+    kill -TERM "$pid"
+    for ((i = 0; i < 100; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+    kill -0 "$pid" 2>/dev/null && { log "pb_term: daemon in $ns did not exit"; return 1; }
+    RESTART_XDP_WHILE_DOWN=$(nsx "$ns" ip -d link show dev veth0 | grep -Eo 'prog/xdp[a-z]* id [0-9]+' | head -n1)
+    log "daemon in $ns exited; XDP while down: ${RESTART_XDP_WHILE_DOWN:-none}"
+}
+flow_count() { pbctl_ns "$1" --json flows --limit 1000000 2>/dev/null |
+    python3 -c 'import json, sys; print(len({(f["src"], f["sport"], f["dst"], f["dport"], f["proto"]) for f in json.load(sys.stdin)}))' ||
+    echo null; }
+restart() {
+    local rep before after mode=$PB_XDP_MODE
+    wanted packetbalance || return 0
+    for ((rep = 1; rep <= REPEATS; rep++)); do
+        all_lbs_off; route_via lb1
+        write_pb_config lb1 maglev true 1048576 >/dev/null
+        if ! pb_start lb1 "$mode" --conntrack-size 1048576; then
+            append restart.jsonl experiment=restart lb=packetbalance "xdp_mode=$mode" "repeat:=$rep" \
+                "notes=daemon failed to start. $NOTES"
+            continue
+        fi
+        RESTART_XDP_WHILE_DOWN=""
+        CONNS=$RESTART_CONNS run_conncheck "$RUN/cc.json" 30 \
+            9 'before=$(flow_count lb1)' \
+            10 "pb_term lb1" \
+            15 "pb_start lb1 $mode --conntrack-size 1048576" \
+            16 'after=$(flow_count lb1)'
+        append restart.jsonl --merge "$RUN/cc.json" experiment=restart lb=packetbalance config=packetbalance \
+            "xdp_mode=$mode" hash=maglev "conntrack:=true" "conntrack_size:=1048576" \
+            "flows_tracked_before:=${before:-null}" "flows_tracked_after_restart:=${after:-null}" \
+            "xdp_while_daemon_down=${RESTART_XDP_WHILE_DOWN:-none}" \
+            "events=daemon SIGTERM at t=10s (no --detach-on-exit), started again at t=15s, end t=30s" \
+            "repeat:=$rep" "notes=$NOTES"
+        pb_stop lb1
+        sleep 2
+    done
+}
+
 # ---------------------------------------------------------------------------
 [[ $# -gt 0 ]] || set -- all
 mkdir -p "$RESULTS"
@@ -371,8 +419,9 @@ for e in "$@"; do
         exp3) exp3 ;;
         exp4) exp4 ;;
         exp6) exp6 ;;
-        all) exp1; exp2; exp3; exp4; exp6 ;;
-        *) die "unknown experiment $e (exp1 exp2 exp3 exp4 exp6 all)" ;;
+        restart) restart ;;
+        all) exp1; exp2; exp3; exp4; exp6; restart ;;
+        *) die "unknown experiment $e (exp1 exp2 exp3 exp4 exp6 restart all)" ;;
     esac
 done
 log "done. Tables: python3 lab/render_tables.py [--write]"

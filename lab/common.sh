@@ -255,3 +255,44 @@ reals_rx_sum() {  # reals_rx_sum <dev> <ns...>
     done
     echo "$s"
 }
+
+# ---------------------------------------------------------------------------
+# Host contention guards for timed measurements (Exp 1, 2, 6).
+# The lab VM's vCPUs are threads on a shared host: other VMs, host apps and the
+# host's scheduler (Apple silicon has performance and efficiency cores) change
+# how fast they run, by 2x in this lab (see docs/bugs/lab.md). Two signals:
+#  * vm_busy_procs: builds inside the VM (compilers, linkers, ninja, apt).
+#  * cpu_canary: a fixed single-threaded Python loop pinned to the VM's last
+#    CPU (the pktgen threads use CPUs 0..3), median iterations per second of
+#    three 0.2 s runs. A slow host shows up as a low canary.
+# host_gate waits (up to GATE_MAX_WAIT s) for no builds and a canary of at least
+# CANARY_MIN before a window starts; the measurement re-checks the canary during
+# and after the window and a row whose minimum canary is below CANARY_MIN is
+# written to results/rejected.jsonl instead, and the window is retried.
+# ---------------------------------------------------------------------------
+CANARY_MIN=${CANARY_MIN:-7000000}
+GATE_MAX_WAIT=${GATE_MAX_WAIT:-600}
+BUSY_RE='^(cc1|cc1plus|clang|clang\+\+|clang-[0-9]+|ld|ld\.lld|lld|ninja|make|cmake|ctest|as|c\+\+|g\+\+|gcc|apt|apt-get|dpkg)$'
+vm_busy_procs() { ps -eo comm= | grep -cE "$BUSY_RE" || true; }
+cpu_canary() {
+    taskset -c "$(($(nproc) - 1))" python3 -c '
+import statistics, time
+def once():
+    t = time.perf_counter(); n = 0
+    while time.perf_counter() - t < 0.2:
+        n += 1
+    return n / 0.2
+print(int(statistics.median(once() for _ in range(3))))'
+}
+# host_gate: prints "<seconds waited> <canary>" once the VM is quiet and fast.
+host_gate() {
+    local waited=0 c b
+    while :; do
+        b=$(vm_busy_procs); c=$(cpu_canary)
+        if [[ $b -eq 0 && $c -ge $CANARY_MIN ]]; then break; fi
+        if ((waited >= GATE_MAX_WAIT)); then log "host_gate: gave up after ${waited}s (builds=$b canary=$c)"; break; fi
+        ((waited % 30 == 0)) && log "host_gate: waiting (builds in VM: $b, cpu canary $c < $CANARY_MIN?)"
+        sleep 2; waited=$((waited + 3))
+    done
+    echo "$waited $c"
+}
