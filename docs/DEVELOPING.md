@@ -27,6 +27,10 @@ On Linux with libbpf, clang, bpftool:
 cmake -B build -G Ninja && cmake --build build && ctest --test-dir build
 ```
 
+On x86-64 hosts `clang -target bpf` pulls in glibc's 32-bit stub header, so install
+`libc6-dev-i386` (Debian/Ubuntu) or `glibc-devel.i686` (Fedora) before building the
+data plane. aarch64 does not need it.
+
 On macOS only the core, pbctl, tools and core tests build (`PB_BUILD_BPF=OFF`,
 `PB_BUILD_DAEMON=OFF` are the defaults there).
 

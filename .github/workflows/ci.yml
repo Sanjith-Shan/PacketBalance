@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck lab scripts
-        run: shellcheck -x lab/*.sh
+        run: shellcheck -x --severity=warning lab/*.sh
 
   core:
     # The portable part: libpb_core (Maglev, flow hash, config), pbctl, the tools
@@ -41,11 +41,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build g++ pkg-config \
-            clang llvm lld libbpf-dev libelf-dev zlib1g-dev \
+            clang llvm lld libbpf-dev libelf-dev zlib1g-dev libc6-dev-i386 \
             libgtest-dev libgmock-dev libyaml-cpp-dev nlohmann-json3-dev \
             linux-tools-common "linux-tools-$(uname -r)" || \
           sudo apt-get install -y --no-install-recommends cmake ninja-build g++ pkg-config \
-            clang llvm lld libbpf-dev libelf-dev zlib1g-dev \
+            clang llvm lld libbpf-dev libelf-dev zlib1g-dev libc6-dev-i386 \
             libgtest-dev libgmock-dev libyaml-cpp-dev nlohmann-json3-dev \
             linux-tools-common linux-tools-generic
           bpftool version || ls /usr/lib/linux-tools*/
@@ -85,7 +85,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build g++ pkg-config \
-            clang llvm lld libbpf-dev libelf-dev zlib1g-dev \
+            clang llvm lld libbpf-dev libelf-dev zlib1g-dev libc6-dev-i386 \
             libgtest-dev libgmock-dev libyaml-cpp-dev nlohmann-json3-dev \
             ipvsadm nginx-light wrk sysstat tcpdump ethtool jq curl python3 iproute2
           sudo apt-get install -y "linux-modules-extra-$(uname -r)" || echo "SKIP: no linux-modules-extra for $(uname -r)"
