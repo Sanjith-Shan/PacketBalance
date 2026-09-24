@@ -25,6 +25,9 @@ Unless an entry says otherwise, the environment was the Lima lab VM (Ubuntu 24.0
 | 16 | `__array(values, ...)` not last in the `rings` map definition | Build and CI | clang `-Werror` |
 | 17 | `clang -target bpf` could not find `<asm/types.h>` | Build and CI | First build of `pb_bpf_obj` |
 | 18 | Daemon could not create its pin path under `ip netns exec` in CI | Build and CI | GitHub Actions log, then `stat -f -c %T` |
+| 19 | The data plane could transmit a frame to MAC 00:00:00:00:00:00 | Data plane | End-to-end code review, then a `BPF_PROG_TEST_RUN` test |
+| 20 | Freeing a real cleared its MAC before its address | Control plane | Code review of `real_table.cpp` write order |
+| 21 | Running out of file descriptors marked healthy reals DOWN | Control plane | Code review of the health checker's per-round socket count |
 
 ## Data plane
 
@@ -108,7 +111,38 @@ math between pkt pointer and register with unbounded min value is not allowed
 
 **Fix.** Fixed. The comment was corrected to say the function is not bit-identical to the kernel's `jhash_3words` and why. The function itself was left alone, because changing it would reshuffle every ring.
 
+### 19. The data plane could transmit a frame to MAC 00:00:00:00:00:00
+
+**Symptom.** Not seen on the wire in the lab. Found by reading `bpf/packetbalance.bpf.c`: after a conntrack hit the program looked up `neigh[real_id]` and tested the pointer for NULL. `neigh` is a `BPF_MAP_TYPE_ARRAY`, so the lookup never returns NULL for an in-range index, and a slot whose MAC had not been written (a reused `real_id` whose new MAC was not resolved yet, or a slot in the middle of being freed) produced a frame with an all-zero destination MAC and no counter recorded it. `docs/DESIGN.md` already claimed this case was dropped.
+
+**Found with.** The end-to-end review, then a new test `Dataplane.UnresolvedMacDropsNoReal` that populates a real with no MAC and asserts `XDP_DROP` and the `no_real` counter.
+
+**Cause.** An array lookup was treated like a hash lookup. The absence check has to be on the value, not the pointer.
+
+**Fix.** Fixed. The program drops and counts `no_real` when the six MAC bytes are all zero. The verifier still accepts the program, at 2841 instructions.
+
 ## Control plane
+
+### 20. Freeing a real cleared its MAC before its address
+
+**Symptom.** Not seen at runtime. `RealTable::write_slot` cleared `neigh[id]` first and `reals[id]` second when a real was deleted. Between the two writes a conntrack entry naming that `real_id` would have read a non-zero address and an all-zero MAC, which is exactly the window bug 19 makes visible.
+
+**Found with.** Reading `src/daemon/real_table.cpp` while checking bug 19's reachable paths.
+
+**Cause.** Both writes are individually correct; only the order between them was wrong for a reader that checks the address first.
+
+**Fix.** Fixed. A freed slot now clears `reals` first so a stale conntrack hit becomes a miss (and rehashes) before the MAC disappears. A new slot still writes `neigh` before `reals`.
+
+### 21. Running out of file descriptors marked healthy reals DOWN
+
+**Symptom.** Not seen in the four-real lab. One health-check round opens a socket for every (TCP VIP, real) pair at once, up to 64 VIPs by 511 reals. Past the default soft limit of 1024 open files, `socket()` fails with `EMFILE`, and the checker counted each failure against the real it was about to probe. With enough VIPs the daemon would have marked healthy reals down and pulled them out of the ring.
+
+**Found with.** Reading `src/daemon/health_checker.cpp` for how a probe failure is classified.
+
+**Cause.** The checker did not distinguish "the real refused" from "the load balancer could not open a socket".
+
+**Fix.** Fixed. Errors that describe the load balancer itself (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `EADDRNOTAVAIL`, `EAGAIN`) set `ProbeResult::local_error`; `LbState::report_health` ignores those results and logs one warning per round; `main.cpp` raises the file-descriptor soft limit to the hard limit at startup. Test: `ControlPlane.LocalProbeErrorsDoNotCount`.
+
 
 These came from `packetbalance` (the daemon) and the shared VIP parser, smoke-tested in the lab VM.
 
