@@ -44,6 +44,13 @@ uint32_t arg_addr(const json& req, const char* name = "addr") {
     }
 }
 
+bool arg_bool(const json& req, const char* name, bool fallback) {
+    if (!req.contains(name)) return fallback;
+    const json& v = req.at(name);
+    if (!v.is_boolean()) throw ApiError(std::string("argument '") + name + "' must be a boolean");
+    return v.get<bool>();
+}
+
 uint32_t arg_uint(const json& req, const char* name, std::optional<uint32_t> fallback = std::nullopt) {
     if (!req.contains(name) && fallback) return *fallback;
     const json& v = arg(req, name);
@@ -95,7 +102,7 @@ json CommandHandler::dispatch(const json& req) {
 
     if (cmd == "ping") return "pong";
     if (cmd == "vip.add") {
-        const bool no_ct = req.value("no_conntrack", false);
+        const bool no_ct = arg_bool(req, "no_conntrack", false);
         return {{"vip_id", state_.add_vip(arg_vip(req), no_ct)}};
     }
     if (cmd == "vip.del") {

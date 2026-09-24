@@ -83,3 +83,82 @@ blamed on the load balancer.
 **Fix.** up.sh raises `ulimit -n` before it starts anything, and each nginx
 config sets `worker_rlimit_nofile 65535`. conncheck and conncheck-server raise
 their own limit.
+
+## The daemon could not pin its maps: `ip netns exec` hides /sys/fs/bpf (found by CI)
+
+**Symptom.** In the CI e2e job, `packetbalance` started with `ip netns exec lb1`
+failed at load with libbpf's `mkdir /sys/fs/bpf/packetbalance/lb1/config: No
+such file or directory`, although bpffs was mounted at /sys/fs/bpf on the host.
+
+**Found with.** The CI log, then in the VM: `ip netns exec lb1 stat -f -c %T
+/sys/fs/bpf` prints `sysfs`, not `bpf_fs`.
+
+**Cause.** `ip netns exec` runs the command in a private mount namespace and
+mounts a fresh sysfs on /sys so /sys/class/net shows the namespace's devices.
+That new sysfs hides everything mounted below the host's /sys, including the
+bpffs at /sys/fs/bpf. The pins the daemon wanted to create (and the ones a
+restarted daemon must find again) were on a filesystem the daemon could not see.
+
+**Fix.** The lab mounts its own bpffs at /run/pblab/bpf (`lab/up.sh`; `down.sh`
+removes the pins and unmounts it). /run is not remounted by `ip netns exec`, so
+the mount, and every pin in it, is visible to each daemon and survives daemon
+restarts. The daemons get `--pin-path /run/pblab/bpf/lb1` (and lb2), and the
+daemon now checks that its pin path is on bpffs with a clear error.
+
+## Native XDP_TX on a veth: frames "sent" and never seen again
+
+**Symptom.** With PacketBalance attached in native mode to veth0 in lb1, every
+`curl http://198.51.100.1/` timed out. `pbctl stats` counted the SYNs as `tx`
+and `ethtool -S veth0` in lb1 showed `rx_queue_N_xdp_tx` rising, but `tcpdump`
+on the peer, pb-lb1, and on real1 saw no IPIP frame at all.
+
+**Found with.** `bpftrace` on `tracepoint:xdp:xdp_bulk_tx` (each XDP_TX flush
+reported `sent=1 drops=0 err=0`), `tcpdump -eni pb-lb1 'ip proto 4'` (nothing),
+and `tracepoint:skb:kfree_skb` (no drop: the frames never became skbs).
+
+**Cause.** XDP_TX on a veth does not go through a transmit queue: the frame is
+put on the peer's XDP ring, which is drained by the peer's NAPI poll. The peer
+(pb-lb1, on the bridge) had no XDP program, and on this 6.8 kernel enabling GRO
+on it (the documented alternative that switches on veth NAPI) did not make the
+frames appear either, including after toggling GRO off and on.
+
+**Fix.** `lab/up.sh` attaches a do-nothing XDP_PASS program
+(`lab/xdp_pass.bpf.c`) to pb-lb1 and pb-lb2. With it the IPIP frames appear on
+pb-lb1 and reach the reals. It stays attached for IPVS runs too, so both
+forwarding planes see the same peer path.
+
+## Encapsulated SYNs dropped by the real as bad checksums
+
+**Symptom.** After the fix above, the IPIP frames reached real1 and `tunl0`'s
+RX counter rose, but there was still no SYN-ACK.
+
+**Found with.** `nstat` in real1: `TcpInCsumErrors` rose with every attempt.
+
+**Cause.** The client's veth has TX checksum offload on, so its TCP stack hands
+the veth a CHECKSUM_PARTIAL skb with the checksum field not yet computed. On a
+veth-to-veth path the receiving stack would trust the skb's checksum state,
+but native XDP sees only the raw bytes, encapsulates them, and the metadata that
+said "checksum still to do" is lost. The real decapsulates and verifies a
+checksum nobody ever computed. A physical NIC always puts a finished checksum on
+the wire, so this is a lab artifact, not a data-plane bug.
+
+**Fix.** `lab/up.sh` turns off TX checksum offload on the client's veth0
+(`ethtool -K veth0 tx off`), so the client sends what a real NIC would. It is set
+for every run, IPVS included.
+
+## UDP echo answered from the wrong address under DSR
+
+**Symptom.** `echo hi | socat - UDP:198.51.100.1:5000` from the client printed
+nothing, through PacketBalance and through IPVS, while the request reached the
+real.
+
+**Found with.** socat in the client namespace against the reals' echo server.
+
+**Cause.** The echo server's socket is bound to 0.0.0.0 and unconnected, so the
+kernel chose the reply's source address by routing: the real's 10.0.0.2x, not
+the VIP. The client's connected socket drops a reply that does not come from the
+address it sent to. This is the UDP half of DSR that TCP gets for free (an
+accepted TCP socket is bound to the address the SYN was sent to).
+
+**Fix.** `lab/udp_echo.py` reads the destination address with `IP_PKTINFO` and
+replies from it.

@@ -76,6 +76,7 @@ void RealTable::drop_unreferenced() {
 }
 
 uint32_t RealTable::acquire(uint32_t addr) {
+    if (addr == 0) throw std::invalid_argument("real address 0.0.0.0 marks a free slot");
     if (auto it = by_addr_.find(addr); it != by_addr_.end()) {
         ++slots_[it->second].refs;
         return it->second;

@@ -79,8 +79,9 @@ std::vector<FlowRow> MapReader::flows(const FlowFilter& keep, size_t limit) cons
         for (int cpu = 0; cpu < ncpus_ && rows.size() < limit; ++cpu) {
             const pb_ct_value& v = values[static_cast<size_t>(cpu)];
             // A per-CPU hash entry exists on every CPU; only the CPUs that saw
-            // the flow have written a value. The others are all zero.
-            if (v.last_seen_ns == 0 && v.real_id == 0) continue;
+            // the flow have written a value. The others are zero-filled. Same
+            // test as the data plane's: last_seen_ns == 0 means "no copy here".
+            if (v.last_seen_ns == 0) continue;
             if (keep && !keep(key, v)) continue;
             rows.push_back(FlowRow{key, v, static_cast<uint32_t>(cpu)});
         }

@@ -127,3 +127,9 @@ is direct to real1, one nginx instead of four; the note says so.
   `expire_nodest_conn=1`, `conntrack=0`, `sloppy_tcp=1` unless a row says 0.
 - The reals' UDP echo servers are paused during packet-rate windows; received
   packets are counted at the interface.
+- The root-side peers of the LB veths (pb-lb1, pb-lb2) carry a do-nothing
+  XDP_PASS program, required for native XDP_TX on veth; it is there for IPVS
+  runs as well. The client's veth has TX checksum offload off, so it sends
+  complete checksums as a physical NIC would. Both are in `docs/bugs/lab.md`.
+- pktgen runs 4 kernel threads by default (`PKTGEN_THREADS`); one thread is
+  generator bound at about 0.7 Mpps through IPVS in this VM.

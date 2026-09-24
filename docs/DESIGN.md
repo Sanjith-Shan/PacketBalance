@@ -203,10 +203,13 @@ counted under the reason named in `enum pb_counter` in `abi.h`.
 8. **Pick the real.**
    - Conntrack disabled daemon-wide or for this VIP: ring lookup, count `hash`.
    - Otherwise, if not a bare SYN, look the 5-tuple up in `conntrack`. A hit with a
-     non-zero timestamp refreshes the timestamp and returns the stored `real_id`
-     (`ct_hit`). Anything else counts `ct_miss` and falls through.
+     non-zero timestamp whose real still has an address in `reals` refreshes the
+     timestamp and returns the stored `real_id` (`ct_hit`). Anything else counts
+     `ct_miss` and falls through: no entry, another CPU's zero-filled copy, or a stale
+     entry whose real was deleted.
    - Ring lookup: `rings[vip_id][hash % 65537]`, count `hash`. Insert the result into
-     `conntrack` unless it is `PB_REAL_NONE` or the packet is ICMP.
+     `conntrack` (overwriting a stale entry) unless it is `PB_REAL_NONE`, the packet is
+     ICMP, or the packet is a TCP RST.
 9. **Resolve the real.** `real_id` out of range (including the `PB_REAL_NONE` sentinel),
    an empty `reals` slot, or a missing `neigh` entry: drop, `no_real`.
 10. **Encapsulate and transmit.** `bpf_xdp_adjust_head(-20)` (failure: drop,
@@ -233,10 +236,15 @@ counted under the reason named in `enum pb_counter` in `abi.h`.
 | `config` | `ARRAY[1]` | lb mac, encap source prefix, feature flags | control plane |
 
 Sizes come from `abi.h`. There are at most 64 VIPs and 512 reals, each ring has 65,537
-slots, and the connection table defaults to 2^20 entries (the daemon can resize it
-before load). Every map is
-pinned by name under the daemon's pin path (default `/sys/fs/bpf/packetbalance`, one
-directory per LB in the lab). Addresses and ports are stored in network byte order, as
+slots, and the connection table defaults to 2^20 entries (`conntrack.size`, fixed when
+the map is created). The size counts keys, that is flows, across all CPUs, not per CPU.
+real_id 0 is never allocated, and 511 reals are usable. Every map is pinned by name
+under the daemon's pin path (default `/sys/fs/bpf/packetbalance`). The pin path must be
+on a bpffs mount. The daemon creates the directory and refuses to start if `statfs`
+says it is not bpffs. That matters under `ip netns exec`, which mounts a fresh sysfs on
+`/sys` and so hides the host's `/sys/fs/bpf`. The lab therefore mounts its own bpffs at
+`/run/pblab/bpf` and gives each LB a directory there (`/run/pblab/bpf/lb1`,
+`/run/pblab/bpf/lb2`). Addresses and ports are stored in network byte order, as
 they are on the wire, so the lookup path never byte-swaps.
 
 `stats` has `PB_MAX_VIPS + 1` entries. The last one, `PB_STATS_GLOBAL`, collects
@@ -441,7 +449,7 @@ spin forever looking for an empty slot.
 
 The size is 65,537 (2^16 + 1, a prime), Maglev's own default. The paper recommends
 M > 100 × N to keep the imbalance under 1%. At 65,537 slots that holds up to about 655
-reals per VIP, which covers PacketBalance's limit of 512 reals.
+reals per VIP, which covers PacketBalance's limit of 511 usable reals.
 A larger M improves resilience to many simultaneous failures but costs build time (the
 paper measured 1.8 ms at 65,537 against 22.9 ms at 655,373) and memory (4 bytes per
 slot, 256 KiB per VIP).
@@ -527,6 +535,10 @@ CPU A inserts a key from a BPF program, the kernel zero-fills the value slot of 
 other CPU. If a later packet of the same flow is processed on CPU B, the lookup finds the
 key and returns B's all-zero value. The program treats a zero `last_seen_ns` as a miss,
 because `bpf_ktime_get_ns()` is never zero after boot, and falls through to the ring.
+The control plane never allocates real_id 0 either, so a zero value could not be
+mistaken for a real even without the timestamp test. `pbctl flows` skips the zero-filled
+copies the same way. On the miss, CPU B inserts its own value for the key; the update
+touches only B's copy, so A's entry is unchanged.
 
 A flow whose packets land on different CPUs therefore misses the table on the second
 CPU. That is harmless as long as the ring has not changed since the flow started,
@@ -545,7 +557,9 @@ what that changes in memory.
 ### Sizing
 
 The LRU is preallocated at load time, and its size cannot change without recreating the
-map (which loses the table). [CAPACITY.md](CAPACITY.md) computes its memory for 1M and 8M
+map (which loses the table). The size is the number of keys shared by all CPUs. Each key
+carries one value per possible CPU, so memory grows with the CPU count, but the flow
+capacity does not. [CAPACITY.md](CAPACITY.md) computes its memory for 1M and 8M
 entries. Too small a table evicts established flows, which then fall back to the ring and
 survive unless the ring changes. So an undersized table fails quietly and only under
 churn.
@@ -560,17 +574,29 @@ TIME_WAIT) does not inherit a stale placement.
 
 **Everything else goes to the table first.** SYN-ACK never reaches the LB (it is a reply).
 ACKs, data, FIN and RST from the client look up the table, and on a miss fall through to
-the ring and insert the result. That fall-through is what lets a second load balancer
-with an empty table pick up an established connection.
+the ring. ACKs, data and FIN insert the result. That fall-through is what lets a second
+load balancer with an empty table pick up an established connection.
+
+**A deleted real is a miss.** An entry can name a real that has since been deleted
+(its `reals` slot is empty). The program treats that as a miss, hashes the packet to a
+live real and overwrites the entry. The connection was already lost with its backend;
+this way the client hears a RST from the new real at once instead of timing out while
+the LB black-holes the flow until LRU eviction. real_ids are per address and shared
+between VIPs, so a real deleted from one VIP but still serving another keeps its slot,
+and that VIP's tracked flows keep reaching it. A real that is only down (failed health
+checks) keeps its slot too, see [Health checking](#health-checking).
 
 **FIN and RST do not delete.** Deleting on FIN buys nothing, since the LRU evicts idle
 entries when it needs space. It costs correctness. The last ACK of a close, a
 retransmitted FIN, or a RST sent after a FIN arrives after the delete, misses, and
 re-hashes. If the ring changed during the connection, that packet goes to a real that has
 never heard of the connection and answers with a RST of its own. Katran does not delete
-on FIN either. Katran also skips inserting an entry for a RST packet, so a stray RST does
-not create state. PacketBalance does insert on RST today. It is a small table-pollution
-difference, not a correctness one.
+on FIN either.
+
+**RST does not insert.** A RST that misses the table (a stray, a scan, a reset for a flow
+another LB carried) is forwarded by hash but creates no entry, so a flood of RSTs cannot
+fill the table with dead flows. A RST that hits follows the entry like any other packet.
+Katran does the same.
 
 **Half-open connections.** A SYN inserts an entry immediately, before the handshake
 completes. A SYN flood fills the table with entries for connections that never complete,
@@ -726,7 +752,8 @@ There are three fixes, and a deployment uses the first two together.
    it is `advmss` on the reals' routes or an MSS clamp. UDP has no MSS, so UDP
    applications must keep datagrams under the path MTU minus 20.
 3. **Forward ICMP "fragmentation needed" to the right real** (the `icmp_pmtu_fwd` path,
-   off unless the `PB_CFG_F_ICMP_PMTU` flag is set). This solves a different problem, PMTU
+   off unless the `PB_CFG_F_ICMP_PMTU` flag is set, which the daemon does for
+   `icmp_pmtu: true` or `--icmp-pmtu`). This solves a different problem, PMTU
    discovery on the return path. The real sends responses directly to the client with
    the VIP as the source. When a router on that path cannot forward a DF packet, it sends
    ICMP frag-needed to the packet's source, the VIP, which is routed to the load balancer,
@@ -743,7 +770,12 @@ There are three fixes, and a deployment uses the first two together.
 ## Health checking
 
 The daemon runs a TCP connect check against each real's own address on the VIP's
-service port every `interval_ms` (1,000 by default), with a `timeout_ms` of 500. A real
+service port every `interval_ms` (1,000 by default), with a `timeout_ms` of 500. All
+checks of a round are started at once and waited for with one `poll`, so a round takes
+at most `timeout_ms` however many reals there are. UDP VIPs are not checked, because
+there is no handshake to test. Their reals are always up and are reported with
+`"checked": false`. `--no-health-check` (or `health_check.enabled: false`) turns
+checking off for every VIP; that setting takes effect on restart only. A real
 goes down after `fall` (3) consecutive failures and comes back after `rise` (2)
 consecutive successes. Any transition rebuilds that VIP's ring and swaps it, and logs one
 line with a timestamp (`UP->DOWN after 3 failures`, `DOWN->UP after 2 successes`), which
@@ -761,8 +793,9 @@ table. If the real is dead they fail anyway. If the health check was wrong (the 
 port is overloaded but established connections are fine), those connections keep
 working, and only new connections avoid the real. That asymmetry is deliberate.
 
-New reals start up. After a daemon restart, reals adopted from the pinned maps also
-start up. A daemon that started every real down and waited for `rise` successes would
+New reals start up, with no successful check yet, and leave the ring after `fall`
+failures if they are not healthy. After a daemon restart, reals adopted from the pinned
+maps also start up. A daemon that started every real down and waited for `rise` successes would
 install an empty ring for two seconds and drop every new connection.
 
 The concession is that the health check connects to the real's own address, not through the
@@ -774,12 +807,14 @@ as real traffic. PacketBalance does not.
 ## Pinned maps and hitless restart
 
 Every map is pinned under the pin path with `LIBBPF_PIN_BY_NAME`. When the daemon
-starts and finds a pinned map with the same type, key size, value size and
-`max_entries`, libbpf reuses it instead of creating a new one. The XDP program is
+starts and finds a pinned map with the same type, key size, value size, `max_entries`
+and flags, libbpf reuses it instead of creating a new one. The daemon compares those
+fields itself before loading, so a mismatch fails with the map and the field named
+rather than libbpf's generic "parameter mismatch". The XDP program is
 attached with `bpf_xdp_attach` over netlink, which is not tied to the daemon's file
 descriptors, so it stays attached after the daemon exits. Stopping the daemon therefore
 leaves forwarding running, with the maps, the rings and the connection table intact.
-Only health checking, the API and metrics stop.
+Only health checking, neighbor resolution, the API and metrics stop.
 
 On restart the daemon:
 
@@ -861,7 +896,7 @@ For a reader who knows Katran, the places where the similarity stops:
 | Connection table | `ARRAY_OF_MAPS` of plain `LRU_HASH` maps, one per CPU, selected with `bpf_get_smp_processor_id()`, plus a fallback map | One `LRU_PERCPU_HASH`, shared keys with a value per CPU. Costs a value per CPU per entry in memory (see [CAPACITY.md](CAPACITY.md)) and shares one LRU list across CPUs unless `BPF_F_NO_COMMON_LRU` is set |
 | Ring storage and update | One flat `ARRAY` for all VIPs, only changed slots batch-written | `ARRAY_OF_MAPS`, a whole new inner map swapped per change |
 | Weights | `MaglevHash` (weight counts in the first round only) or `MaglevHashV2` (proportional) | Proportional, w turns per round |
-| RST | Not inserted into the LRU | Inserted |
+| RST | Not inserted into the LRU | Not inserted into the LRU |
 | UDP | 30 s idle expiry | LRU eviction only |
 | Encap source | `172.16.0.0/16`, low 16 bits from source port XOR source address | Configurable prefix, default /24, host bits from the flow hash |
 | Maximum packet | 1,514-byte frame by default, 3.5 KB maximum | 3,500-byte IP packet |

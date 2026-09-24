@@ -2,10 +2,10 @@
 # Tear down everything lab/up.sh created, and nothing else: processes running
 # inside the lab namespaces (daemons, nginx, echo servers, conncheck), pktgen
 # devices in the client namespace, IPVS tables in lb1/lb2, the namespaces
-# client lb1 lb2 real1..real5, the root-side pb-* veths, br0, /run/pblab and
-# the lab daemons' pin directories /sys/fs/bpf/packetbalance/{lb1,lb2}.
-# Other pin directories (for example another developer's daemon pinned at
-# /sys/fs/bpf/packetbalance itself, or the pbdev namespace) are left alone.
+# client lb1 lb2 real1..real5, the root-side pb-* veths, br0, the lab daemons'
+# pins in the lab bpffs at /run/pblab/bpf/{lb1,lb2}, that bpffs mount, and
+# /run/pblab. Pins anywhere else (/sys/fs/bpf, another developer's pbdev
+# namespace) are left alone.
 set -euo pipefail
 # shellcheck source=lab/common.sh
 source "$(dirname "$0")/common.sh"
@@ -47,5 +47,6 @@ if ip link show "$BR" >/dev/null 2>&1; then run ip link del "$BR"; fi
 for ns in "${LB_NS[@]}"; do
     [[ -e $PIN_ROOT/$ns ]] && run rm -rf "${PIN_ROOT:?}/$ns"
 done
+if mountpoint -q "$PIN_ROOT"; then run umount "$PIN_ROOT"; fi
 [[ -d $RUN ]] && run rm -rf "$RUN"
 log "lab is down"

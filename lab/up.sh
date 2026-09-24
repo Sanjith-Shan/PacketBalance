@@ -35,7 +35,8 @@ build() {
         cmake --build "$dir" --target conncheck conncheck-server >>"$RUN/build.log" 2>&1 || return 1
     fi
 }
-mkdir -p "$RUN"
+mkdir -p "$RUN" "$PIN_ROOT"
+mountpoint -q "$PIN_ROOT" || run mount -t bpf bpf "$PIN_ROOT"
 if [[ ${LAB_SKIP_BUILD:-0} != 1 ]]; then
     build || die "build failed, see $RUN/build.log"
 fi
@@ -87,19 +88,35 @@ for ns in "${ALL_NS[@]}"; do mk_ns "$ns"; done
 # --- client ---------------------------------------------------------------------
 nsx client sysctl -qw net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 \
     net.core.somaxconn=65535
+# No TX checksum offload on the client: a veth hands a CHECKSUM_PARTIAL skb to
+# its peer with the TCP/UDP checksum not yet filled in. The stack would finish
+# it later, but an XDP program works on the raw frame, encapsulates it, and the
+# real then drops the inner segment as TcpInCsumErrors. A physical NIC always
+# puts a complete checksum on the wire, which is what this restores.
+nsx client ethtool -K veth0 tx off >/dev/null
 route_via lb1
 
 # --- load balancers ---------------------------------------------------------------
 # Neither IPVS DR nor XDP forwarding needs ip_forward: IPVS consumes VIP packets
 # in LOCAL_IN (the VIP is on lo while IPVS is up) and XDP never reaches the
 # stack. Keeping it off means a detached LB does not route VIP packets anywhere.
-for ns in "${LB_NS[@]}"; do
-    nsx "$ns" sysctl -qw net.ipv4.ip_forward=0
-    # A veth only accepts XDP_TX'd / redirected frames if its PEER runs NAPI,
-    # which needs an XDP program or GRO on the peer. The peer of lb's veth0 is
-    # pb-<lb> on the bridge. Without this, native-mode XDP_TX frames vanish.
-    ethtool -K "pb-$ns" gro on >/dev/null 2>&1 || log "WARN: ethtool -K pb-$ns gro on failed"
-done
+# Native XDP_TX on a veth hands the frame to the PEER's XDP ring, which is only
+# drained when the peer runs XDP itself. The peer of lb's veth0 is pb-<lb> on the
+# bridge. Without a program there, XDP_TX'd frames are counted as sent
+# (tracepoint xdp:xdp_bulk_tx sent=1 err=0) and never seen again; enabling GRO
+# on the peer did not help on 6.8. So pb-lb1/pb-lb2 get a do-nothing XDP_PASS
+# program (lab/xdp_pass.bpf.c). It is there for IPVS runs too, so both planes
+# see the same peer path. See docs/bugs/lab.md.
+XDP_PASS_OBJ=$RUN/xdp_pass.o
+if clang -O2 -target bpf -I"/usr/include/$(uname -m)-linux-gnu" -c "$LAB_DIR/xdp_pass.bpf.c" -o "$XDP_PASS_OBJ" 2>"$RUN/xdp_pass.log"; then
+    for ns in "${LB_NS[@]}"; do
+        run ip link set dev "pb-$ns" xdpdrv obj "$XDP_PASS_OBJ" sec xdp ||
+            log "WARN: could not attach XDP_PASS to pb-$ns; native XDP_TX from $ns will be lost"
+    done
+else
+    log "WARN: clang could not build lab/xdp_pass.bpf.c ($RUN/xdp_pass.log); native XDP_TX from the LBs will be lost"
+fi
+for ns in "${LB_NS[@]}"; do nsx "$ns" sysctl -qw net.ipv4.ip_forward=0; done
 
 # --- reals --------------------------------------------------------------------
 write_nginx_conf() {

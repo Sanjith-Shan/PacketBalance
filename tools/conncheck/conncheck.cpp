@@ -120,7 +120,7 @@ Options parse(int argc, char** argv) {
     }
     if (o.vip_host.empty() || o.vip_port <= 0 || o.vip_port > 65535 || o.connections <= 0 ||
         o.heartbeat_ms <= 0 || o.duration_s <= 0 || o.connect_rate <= 0 || o.ramp_ms <= 0 ||
-        o.timeout_ms <= 0)
+        o.timeout_ms <= 0 || o.connect_timeout_ms <= 0)
         usage();
     return o;
 }
@@ -156,9 +156,9 @@ public:
         t0_ = now_ms();
         const int64_t end = t0_ + static_cast<int64_t>(o_.duration_s) * 1000;
         int64_t next_batch = t0_;
+        int64_t batches = 0;
         int64_t next_scan = t0_;
         int64_t next_progress = t0_ + 5000;
-        const int per_batch = std::max(1, static_cast<int>(static_cast<int64_t>(o_.connect_rate) * o_.ramp_ms / 1000));
         size_t next_idx = 0;
         std::vector<epoll_event> evs(4096);
 
@@ -166,11 +166,15 @@ public:
             int64_t now = now_ms();
             if (now >= end) break;
 
-            // Ramp: issue the next batch of connects.
+            // Ramp: issue the next batch of connects. Batch k brings the total
+            // up to connect_rate * (k + 1) * ramp_ms / 1000, so the average rate
+            // is --connect-rate even when one batch would round to zero connects.
             if (next_idx < conns_.size() && now >= next_batch) {
-                for (int k = 0; k < per_batch && next_idx < conns_.size(); ++k) start_connect(next_idx++, now);
+                ++batches;
+                const auto due = static_cast<size_t>(std::max<int64_t>(
+                    1, static_cast<int64_t>(o_.connect_rate) * batches * o_.ramp_ms / 1000));
+                while (next_idx < conns_.size() && next_idx < due) start_connect(next_idx++, now);
                 next_batch += o_.ramp_ms;
-                if (next_idx == conns_.size()) ramp_issued_at_ = now;
             }
             // Snapshot per-backend counts once every connect resolved.
             if (!start_snapshot_taken_ && next_idx == conns_.size() && pending_connects_ == 0 && all_have_backend()) {
@@ -494,7 +498,6 @@ private:
     int ep_ = -1;
     int64_t t0_ = 0;
     int64_t elapsed_ms_ = 0;
-    int64_t ramp_issued_at_ = 0;
     int64_t ramp_done_ms_ = 0;
     uint64_t pending_connects_ = 0;
     uint64_t established_ = 0;

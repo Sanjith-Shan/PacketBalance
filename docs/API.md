@@ -35,21 +35,23 @@ A VIP is written `ADDR:PORT/PROTO`, for example `198.51.100.1:80/tcp` or
 | `ping` | | `"pong"` |
 | `vip.add` | `vip`, optional `no_conntrack` (bool) | `{"vip_id": n}` |
 | `vip.del` | `vip` | `{}` |
-| `vip.list` | | `[{"vip", "vip_id", "flags", "reals": [{"addr","real_id","weight","up","draining"}]}]` |
-| `real.add` | `vip`, `addr`, optional `weight` (default 1) | `{"real_id": n}` |
+| `vip.list` | | `[{"vip", "vip_id", "flags", "generation", "reals": [{"addr","real_id","weight","up","draining","in_ring","mac"}]}]` `flags` is `PB_VIP_F_*` (1 = no conntrack). `generation` counts ring swaps since the daemon started. `in_ring` says whether the real currently owns slots (weight > 0, not draining, up, MAC resolved). `mac` is the destination MAC written to `neigh`, or `null` while unresolved |
+| `real.add` | `vip`, `addr` (not `0.0.0.0`), optional `weight` (default 1, max 1000) | `{"real_id": n}` real_id is per address and shared by every VIP that uses the real. It is never 0 |
 | `real.del` | `vip`, `addr` | `{}` |
 | `real.weight` | `vip`, `addr`, `weight` | `{}` |
-| `real.drain` | `vip`, `addr` | `{}` weight becomes 0 so no new flow hashes to it, existing flows keep going through the connection table. Health checks continue. |
-| `real.undrain` | `vip`, `addr` | `{}` restores the configured weight |
+| `real.drain` | `vip`, `addr` | `{}` the real takes no ring slots, as if its weight were 0, so no new flow hashes to it. Existing flows keep going through the connection table. The configured weight is kept (and still reported). Health checks continue. |
+| `real.undrain` | `vip`, `addr` | `{}` the real takes slots for its configured weight again (if it is up) |
 | `stats` | optional `vip` | `{"global": {counter: n, ...}, "vips": {"<vip>": {counter: n, ...}}, "reals": {"<addr>": {"packets": n, "bytes": n}}}` counters are the names in `enum pb_counter` lower-cased without the `PB_CNT_` prefix, summed over CPUs |
-| `flows` | optional `vip`, optional `real`, optional `limit` (default 1000) | `[{"src","dst","sport","dport","proto","real","vip","age_ms","cpu"}]` walks every per-CPU LRU entry |
-| `ring.show` | `vip` | `{"size": 65537, "hash": "maglev"|"modulo", "slots": {"<addr>": n, "none": n}, "generation": n}` |
-| `health` | | `[{"vip","addr","up","consecutive_ok","consecutive_fail","last_change_ms","last_rtt_us"}]` |
-| `reload` | | `{}` re-reads the YAML config, applies VIP and real differences without touching the connection table |
-| `config` | | the effective daemon config as JSON (interface, xdp_mode, hash, conntrack, encap source, health check parameters) |
+| `flows` | optional `vip`, optional `real`, optional `limit` (default 1000) | `[{"src","dst","sport","dport","proto","real","vip","age_ms","cpu"}]` walks the LRU and returns one row per (key, CPU) that holds a value. The other CPUs' zero-filled copies are skipped. `real` is `"#<real_id>"` if the id is no longer allocated |
+| `ring.show` | `vip` | `{"size": 65537, "hash": "maglev"\|"modulo", "slots": {"<addr>": n, "none": n}, "generation": n}` |
+| `health` | | `[{"vip","addr","up","checked","consecutive_ok","consecutive_fail","last_change_ms","last_rtt_us"}]` `checked` is false for reals of UDP VIPs and when health checks are off; those reals are always `up`. `last_change_ms` is Unix epoch milliseconds |
+| `reload` | | `{}` re-reads the YAML config, applies VIP and real differences without touching the connection table. Drops runtime-only changes. `interface`, `xdp_mode`, `conntrack.size`, `socket`, `pin_path`, `metrics.listen` and `health_check.enabled` take effect on restart only (the daemon logs a warning) |
+| `config` | | the effective daemon config: `config_path`, `interface`, `xdp_mode` (in effect), `xdp_mode_requested`, `hash`, `conntrack` `{enabled, size}`, `encap_src_prefix`, `icmp_pmtu`, `next_hop`, `socket`, `pin_path`, `metrics_listen`, `health_check` `{enabled, interval_ms, timeout_ms, fall, rise}`, `detach_on_exit`, `num_possible_cpus`, `vips` (as configured in the YAML, not runtime changes) |
 
 Errors are strings such as `"unknown vip 198.51.100.1:80/tcp"`, `"real already exists"`,
-`"ring full"`. `pbctl` prints `error: <message>` to stderr and exits 1.
+`"unknown real 10.0.0.25 on vip 198.51.100.1:80/tcp"`, `"too many vips (max 64)"`,
+`"argument 'weight' must be a non-negative integer"`. `pbctl` prints `error: <message>` to
+stderr and exits 1.
 
 ## pbctl
 
@@ -81,7 +83,7 @@ Without `--json`, `pbctl` prints a human table. With `--json` it prints the raw
 the same per-CPU maps and summed.
 
 ```
-pb_packets_total{vip="198.51.100.1:80/tcp"} 
+pb_packets_total{vip="198.51.100.1:80/tcp"}
 pb_bytes_total{vip=...}
 pb_real_packets_total{real="10.0.0.21"}
 pb_conntrack_hits_total{vip=...}
@@ -95,4 +97,10 @@ pb_real_up{vip=...,real=...} 0|1
 pb_real_weight{vip=...,real=...}
 pb_ring_generation{vip=...}
 pb_conntrack_entries
+pb_xdp_mode{mode="native"|"generic"} 1
 ```
+
+Drops counted before the VIP is known (fragments, IP options, truncated headers, a
+missing config) carry `vip="global"`. `pb_real_weight` is the configured weight, which
+a drain does not change. `pb_conntrack_entries` is the number of keys (flows) in the
+table, not per-CPU values, and costs an O(entries) walk per scrape.

@@ -6,13 +6,14 @@
 # Everything the lab creates is named here, so down.sh can remove exactly that
 # and nothing else: the namespaces client, lb1, lb2, real1..real5, the bridge
 # br0, root-side veth peers pb-<ns>, runtime state under /run/pblab, and the
-# daemon pin directories /sys/fs/bpf/packetbalance/lb1 and .../lb2.
+# lab's own bpffs mounted at /run/pblab/bpf holding the daemons' pins
+# (/run/pblab/bpf/lb1, /run/pblab/bpf/lb2).
 
 LAB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$LAB_DIR/.." && pwd)"
 GEN="$LAB_DIR/gen"            # generated daemon configs (lab/gen/lb1.yaml ...)
 RUN=/run/pblab                # pid files, logs, nginx prefixes (tmpfs, root owned)
-RESULTS="$REPO/results"
+RESULTS=${PB_RESULTS_DIR:-$REPO/results}   # override for scratch runs
 
 VIP=198.51.100.1
 VIP_NET=198.51.100.0/24
@@ -21,7 +22,11 @@ LB_NS=(lb1 lb2)
 REAL_NS=(real1 real2 real3 real4 real5)
 ALL_NS=(client lb1 lb2 real1 real2 real3 real4 real5)
 DEFAULT_REALS=(10.0.0.21 10.0.0.22 10.0.0.23 10.0.0.24)   # real5 is only for the Exp 4 drift case
-PIN_ROOT=/sys/fs/bpf/packetbalance
+# Not /sys/fs/bpf: `ip netns exec` gives the command a private mount namespace
+# with a fresh sysfs on /sys, which hides the host's bpffs at /sys/fs/bpf. A
+# bpffs mounted under /run in the root mount namespace is inherited by every
+# `ip netns exec`, so pins survive daemon restarts. up.sh mounts it.
+PIN_ROOT=$RUN/bpf
 
 # The client's route to the VIP carries mtu 1480 so TCP's MSS is 1440: a full
 # segment plus the 20-byte outer IPIP header still fits the 1500-byte veths.
@@ -162,15 +167,18 @@ pb_start() {
     local bin sock pin i
     bin=$(find_bin packetbalance) || die "packetbalance daemon not built (cmake --build build)"
     sock=$(pb_sock "$ns"); pin=$(pb_pin "$ns")
-    mkdir -p "$RUN" "$pin"
+    mountpoint -q "$PIN_ROOT" || die "$PIN_ROOT is not a bpffs mount (run lab/up.sh)"
+    mkdir -p "$pin"
     rm -f "$sock"
     log "start packetbalance in $ns: --xdp-mode $mode $*"
-    ip netns exec "$ns" setsid "$bin" --config "$GEN/$ns.yaml" --xdp-mode "$mode" "$@" \
+    ip netns exec "$ns" setsid "$bin" --config "$GEN/$ns.yaml" --xdp-mode "$mode" \
+        --pin-path "$pin" --socket "$sock" "$@" \
         </dev/null >"$RUN/pb-$ns.log" 2>&1 &
     echo $! >"$RUN/pb-$ns.pid"
     for ((i = 0; i < 100; i++)); do
         if [[ -S $sock ]] && pbctl_ns "$ns" ping >/dev/null 2>&1; then
             log "packetbalance in $ns is up (pid $(cat "$RUN/pb-$ns.pid"))"
+            pb_wait_rings "$ns"
             return 0
         fi
         if ! kill -0 "$(cat "$RUN/pb-$ns.pid")" 2>/dev/null; then
@@ -183,6 +191,23 @@ pb_start() {
     log "packetbalance in $ns did not answer ping within 20 s"
     tail -n 20 "$RUN/pb-$ns.log" >&2 || true
     return 1
+}
+
+# pb_wait_rings <lbns>: the daemon adds a real to a VIP's ring only once its
+# neighbor (MAC) is resolved, so right after start the rings fill over ~100 ms.
+# Wait until every configured real of every VIP is in its ring (max 10 s).
+pb_wait_rings() {
+    local ns=$1 i
+    for ((i = 0; i < 50; i++)); do
+        if pbctl_ns "$ns" --json vip list 2>/dev/null | python3 -c '
+import json, sys
+v = json.load(sys.stdin)
+sys.exit(0 if v and all(r.get("in_ring", True) for x in v for r in x.get("reals", [])) else 1)'; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    log "WARN: not every real of $ns is in its ring after 10 s"
 }
 
 # pb_stop <lbns>: stop the daemon, detach XDP, remove its pinned maps so the

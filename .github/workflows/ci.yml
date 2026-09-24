@@ -97,7 +97,9 @@ jobs:
       - name: modules
         id: mods
         run: |
-          # Pinned maps need bpffs. Runners do not mount it by default.
+          # bpftool and ad-hoc pins want bpffs at /sys/fs/bpf; runners do not mount it.
+          # The lab daemons pin into their own bpffs at /run/pblab/bpf (lab/up.sh mounts
+          # it) because `ip netns exec` hides /sys/fs/bpf behind a fresh sysfs.
           mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
           for m in ipip ip_vs ip_vs_mh ip_vs_rr pktgen; do
             if sudo modprobe "$m"; then echo "$m=1" >> "$GITHUB_OUTPUT"; else echo "SKIP: module $m unavailable"; echo "$m=0" >> "$GITHUB_OUTPUT"; fi

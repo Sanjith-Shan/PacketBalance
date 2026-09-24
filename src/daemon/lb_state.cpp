@@ -247,6 +247,9 @@ void LbState::remove_member_locked(Vip& v, uint32_t addr) {
 uint32_t LbState::add_real(const VipSpec& vip, uint32_t addr, uint32_t weight) {
     std::lock_guard lock(mu_);
     Vip& v = vip_or_throw(vip);
+    // 0.0.0.0 is the "unused slot" marker in `reals`: the data plane would
+    // treat the real as absent, and RealTable would hand its id out again.
+    if (addr == 0) throw ApiError("bad real address 0.0.0.0");
     if (v.members.count(addr)) throw ApiError("real already exists");
     if (weight > kMaxRealWeight) throw ApiError("weight must be 0.." + std::to_string(kMaxRealWeight));
     add_member_locked(v, addr, weight);
