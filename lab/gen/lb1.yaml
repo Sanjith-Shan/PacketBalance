@@ -5,7 +5,7 @@ hash: maglev
 encap_src_prefix: 10.99.0.0/24
 conntrack:
   enabled: true
-  size: 8388608
+  size: 1048576
 socket: /run/pblab/pb-lb1.sock
 pin_path: /run/pblab/bpf/lb1
 metrics:

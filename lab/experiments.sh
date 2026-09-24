@@ -16,6 +16,7 @@
 #   PB_XDP_MODE=native XDP mode for Exp 2, 3, 4, 6
 #   NOTES="..."        appended to every row's notes
 #   PKTGEN_THREADS=4   pktgen kernel threads for Exp 1 and 6
+#   EXP6_DONE="1:false:1048576 ..."  Exp 6 windows (repeat:conntrack:size) to skip when resuming
 #
 # PacketBalance configurations are skipped (with a log line) when the daemon or
 # pbctl is not built. Only one forwarding plane owns the VIP at any time: every
@@ -374,6 +375,8 @@ exp6() {
     for ((rep = 1; rep <= REPEATS; rep++)); do
         for c in "${cases[@]}"; do
             read -r ct size <<<"$c"
+            # EXP6_DONE="rep:ct:size ..." skips windows already measured (resume)
+            if [[ " ${EXP6_DONE:-} " == *" $rep:$ct:$size "* ]]; then log "exp6: skip $rep:$ct:$size (EXP6_DONE)"; continue; fi
             all_lbs_off; route_via lb1
             mem_note="MemAvailable before start: $(awk '/MemAvailable/ {print $2 " kB"}' /proc/meminfo)"
             if ! setup_pb lb1 "$PB_XDP_MODE" maglev "$ct" "$size"; then
