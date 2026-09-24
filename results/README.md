@@ -15,7 +15,10 @@ commit message, never "corrected".
 | `exp3_churn.jsonl` | 3, connection survival through backend churn | `experiments.sh exp3` (conncheck) |
 | `exp4_failover.jsonl` | 4, connection survival through LB failover | `experiments.sh exp4` (conncheck) |
 | `exp5_hash_quality.json` | 5, hash quality (one JSON document) | `tools/hashquality` |
+| `exp1_mitigations.jsonl` | 1, native-XDP loss accounting and lab mitigations (`variant`) | `lab/measure.sh` with `MEASURE_VARIANT` |
 | `exp6_conntrack.jsonl` | 6, cost of the connection table | `lab/measure.sh` via `experiments.sh exp6` |
+| `restart.jsonl` | daemon restart keeps flows | `experiments.sh restart` (conncheck) |
+| `rejected.jsonl` | packet-rate windows that failed the host contention guard | `lab/measure.sh` |
 
 ## What each `lb` label means
 
@@ -67,8 +70,21 @@ IPVS is usually deployed.
 | `lb_cpu_util` | `100 - %idle` of the `all` row of `mpstat -P ALL 1 <duration>` during the window |
 | `softirq_util` | `%soft` of the `all` row (where XDP, the bridge and IPVS run) |
 | `per_cpu_util` | `100 - %idle` per CPU |
-| `pps_per_core` | estimate, see below |
+| `pps_per_core` | estimate, see below, from `forwarded_pps` |
 | `pps_per_core_basis` | `forwarded_pps`, or `received_pps` for `lb=none` |
+| `pps_per_core_received` | the same estimate from `received_pps`. **The tables use this one**: it counts only frames that arrived |
+| `reals_rx_dropped_pps` | frames that reached a real's veth0 but were dropped by its full receive backlog (`rx_dropped`, `net.core.netdev_max_backlog`); not in `received_pps` |
+| `pb_counters_delta`, `pb_drops_delta` | PacketBalance only: every `pbctl --json stats` counter summed over global and VIPs, as a delta over the window; the nonzero `drop_*` reasons |
+| `lb_veth_xdp_delta` | the LB veth0's per-queue XDP stats from `ethtool -S`, summed, delta over the window. `xdp_tx_errors` = frames the XDP program XDP_TX'd that the peer's ring refused (native mode); PacketBalance counts them in `tx` |
+| `lb_veth_tx_dropped_pps` | the LB veth0's `tx_dropped` rate (generic-mode XDP_TX and the IPVS transmit path lose frames here when the peer is full) |
+| `lb_veth_xdp_tx_errors`, `lb_veth_xdp_drops` | the two XDP driver counters from `lb_veth_xdp_delta`, as window counts |
+| `peer_rx_dropped` | `rx_dropped` of the LB veth's bridge-side peer (`pb-lb1`) over the window: the same event as `lb_veth_tx_dropped`, seen from the other end |
+| `peer_xdp_delta` | `ethtool -S pb-lb1` XDP stats (the do-nothing XDP_PASS program there, which drains native XDP_TX frames) |
+| `netdev_delta` | `rx/tx_packets`, `rx/tx_dropped` over the window of every device on the path: `client:veth0`, `root:pb-client`, `root:pb-lb1`, `root:br0`, `lb1:veth0`, `root:pb-realN`, `realN:veth0`, plus `softnet_dropped` (/proc/net/softnet_stat, backlog-full drops, whole VM) |
+| `packet_accounting` | PacketBalance rows: where every frame went, as window counts. See "Packet accounting" below |
+| `variant` | `standard`, or the name of a lab mitigation (`exp1_mitigations.jsonl`) |
+| `mpstat_samples` | one-second `mpstat` samples in the window (must equal the duration) |
+| `cpu_canary`, `cpu_canary_in_window`, `cpu_canary_min_required`, `quiet_wait_s`, `vm_build_seconds_in_window`, `host_gate` | host contention guard, see below |
 
 ### pps per core, and why it is an estimate
 
@@ -87,6 +103,89 @@ dedicated LB host. `docs/CAPACITY.md` says so where it uses it.
 With native XDP on a veth, the XDP program runs in the veth's NAPI poll on the
 CPU that transmitted into the veth, so at one pktgen thread most of the path
 runs on one CPU; `per_cpu_util` shows where the work landed.
+
+### Packet accounting (PacketBalance rows)
+
+```
+offered_by_client            client veth0 tx_packets
+ - dropped_before_lb_program   pb-lb1 tx_dropped: the LB veth's receive ring was full, the XDP program never saw the frame
+ = frames the program ran on ~ pb_tx (every VIP frame ends in XDP_TX; pb_drops_delta is 0 in every row)
+pb_tx                        the program's tx counter (XDP_TX verdicts)
+ = received_at_reals          reals' veth0 rx_packets
+ + lb_veth_tx_dropped         the LB veth could not hand the frame to its peer pb-lb1 (peer ring full).
+                              Native: also counted as xdp_tx_errors on lb1 veth0 and rx_dropped on pb-lb1
+                              (same_event_* fields, one event, three counters, subtracted once)
+ + peer_xdp_drops             pb-lb1's XDP_PASS program dropped it (always 0)
+ + reals_rx_dropped           the real's receive backlog was full (same event as the bridge port's tx_dropped)
+ + unaccounted                timing skew between the stats and netdev snapshots, frames in flight
+```
+
+A 30 s native window at saturation (4 pktgen threads, 10,000 flows), from
+`exp1_mitigations.jsonl` / `exp1_pps.jsonl`: the client offered about 150 M frames,
+108 M were dropped before the program because lb1's veth receive ring was full,
+the program forwarded about 42 M (its `tx`), 23 M of those were lost handing
+them to pb-lb1 (`xdp_tx_errors`), and 19 M arrived at the reals. The loss is
+in the veth driver on either side of the program, not in the program: its own
+drop counters are 0 and the conntrack hit rate is above 99.9%.
+
+### Exp 1 in this VM: native XDP forwards less than IPVS, and why
+
+Published as measured. On veth, native XDP is not "the driver's RX ring before
+the skb": the frame arrives through the bridge-side peer's transmit into lb1's
+veth ptr_ring, the program runs in that veth's NAPI poll, and XDP_TX puts the
+frame on the peer's (pb-lb1's) ptr_ring, where a second XDP program
+(XDP_PASS) has to build the skb that the bridge forwards. Both rings hold 256
+frames, and all of it runs in softirq on the CPU of the pktgen thread that sent
+the frame (CPUs 0 to 3; CPUs 4 and 5 stay idle). Unthrottled, the generator
+fills lb1's ring faster than the NAPI drains it (about 70% of offered frames
+are dropped before the program), and the program's XDP_TX outruns pb-lb1's
+drain (about half of what it forwards is lost there). IPVS and generic XDP
+take the stack's backlog path, which paces the generator (offered 2.2 to
+2.5 M instead of 5 M) and loses less. The throttled sweep shows the same: every
+plane is lossless up to 1 M pps; at 2 M offered, native delivers 1.64 M, generic
+1.72 M, IPVS `mh` 1.82 M.
+
+`exp1_mitigations.jsonl` tries lab changes one at a time. Steering the skb work
+after pb-lb1 to CPUs 4 and 5 with RPS lifts native from 0.64 M to 0.97 M and
+generic from 1.39 M to 1.75 M received, but lowers IPVS `mh` from 2.21 M to
+1.55 M, so it is not a neutral lab setting and the published table does not
+use it. Halving the generator to 2 threads makes generic and IPVS generator
+bound (0.95 M and 0.91 M, offered = received) and native still loses 60% of
+its offered load before the program (0.77 M received). Enabling NAPI on pb-lb1
+with GRO instead of the XDP_PASS program does not deliver native XDP_TX frames
+at all on this kernel (every curl timed out), as `docs/bugs/lab.md` records.
+None of this says what native XDP does on a physical NIC, where the program runs
+on the driver's RX ring and XDP_TX goes to the NIC's own TX ring.
+
+### Host contention guard
+
+The VM's vCPUs are threads on a shared Mac. Before this guard existed, three
+30 s windows of the same IPVS configuration measured 121 k, 1.04 M and 2.06 M
+pps (moved to `superseded/`, see `docs/bugs/lab.md`). Now every packet-rate
+window (and every Exp 2 wrk run) starts only when no compiler or build runs in
+the VM and a CPU canary (a fixed single-threaded Python loop pinned to the last
+vCPU, which the generator does not use; iterations per second) is at least
+`CANARY_MIN` (12,000,000 in this lab; about 17 M on a quiet host, 7 to 12 M with
+a video call running on the Mac). The canary is taken again when the window
+ends. A window whose canary fell below the minimum, or that had a build running,
+is written to `rejected.jsonl` instead and retried (`host_gate: "fail"`).
+Rejected windows are kept there, not deleted.
+
+## `superseded/`
+
+Rows measured before a harness change that makes them incomparable with the
+current rows. They are kept for provenance and are not rendered.
+`*.pre-host-gate.jsonl`: Exp 1, Exp 1 sweep and Exp 2 baseline rows measured
+without the host contention guard; every configuration was re-measured with it.
+
+## Daemon restart rows (`restart.jsonl`)
+
+`lab/experiments.sh restart`: conncheck holds 1,000 connections through lb1
+(native); the daemon, started without `--detach-on-exit`, gets SIGTERM at t=10 s
+and is started again at t=15 s. `flows_tracked_before` /
+`flows_tracked_after_restart` are distinct 5-tuples in the pinned connection
+table (`pbctl flows`); `xdp_while_daemon_down` is the program still attached
+while no daemon ran.
 
 ## conncheck rows (Exp 3, Exp 4)
 

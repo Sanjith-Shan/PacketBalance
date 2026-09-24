@@ -85,6 +85,21 @@ sleep_until() {  # sleep_until <epoch seconds, fractional ok>
 }
 append() { local file=$1; shift; $LABUTIL row "$@" >>"$RESULTS/$file"; tail -n1 "$RESULTS/$file" >&2; }
 
+# measure: lab/measure.sh, retried when the window fails the host gate (exit 3,
+# row in results/rejected.jsonl), up to MEASURE_TRIES windows in total. Any
+# other failure is logged and the experiment moves on.
+MEASURE_TRIES=${MEASURE_TRIES:-4}
+measure() {
+    local try rc
+    for ((try = 1; try <= MEASURE_TRIES; try++)); do
+        rc=0; "$LAB_DIR/measure.sh" "$@" || rc=$?
+        [[ $rc == 3 ]] || break
+        log "window failed the host gate (try $try of $MEASURE_TRIES), retrying"
+    done
+    [[ $rc == 0 ]] || log "WARN: measure.sh exited $rc"
+    return 0
+}
+
 # check_vip: the VIP answers HTTP through whatever is configured. Prints the body.
 check_vip() { nsx client curl -s --max-time 3 "http://$VIP/" || echo "FAILED"; }
 
@@ -184,7 +199,7 @@ exp1() {
             fi
             body=""; [[ $label != none ]] && body=$(check_vip)
             read -r plane mode hash ct <<<"$(describe "$label")"
-            "$LAB_DIR/measure.sh" --name exp1_pps --experiment exp1 --lb "$plane" --lbns lb1 \
+            measure --name exp1_pps --experiment exp1 --lb "$plane" --lbns lb1 \
                 --xdp-mode "$mode" --hash "$hash" --conntrack "$ct" \
                 --conntrack-size "$([[ $plane == packetbalance ]] && echo 1048576 || echo null)" \
                 --flows 10000 --duration "$DURATION" --repeat "$rep" \
@@ -199,7 +214,7 @@ exp1() {
         setup_label "$label" lb1 1048576 || continue
         read -r plane mode hash ct <<<"$(describe "$label")"
         for rate in $EXP1_RATES; do
-            "$LAB_DIR/measure.sh" --name exp1_sweep --experiment exp1_sweep --lb "$plane" --lbns lb1 \
+            measure --name exp1_sweep --experiment exp1_sweep --lb "$plane" --lbns lb1 \
                 --xdp-mode "$mode" --hash "$hash" --conntrack "$ct" \
                 --conntrack-size "$([[ $plane == packetbalance ]] && echo 1048576 || echo null)" \
                 --flows 10000 --duration 10 --rate "$rate" --repeat 1 --notes "config=$label; $NOTES"
@@ -212,7 +227,7 @@ exp1() {
 # Experiment 2: latency and throughput through the LB (wrk)
 # ===========================================================================
 exp2() {
-    local labels=(packetbalance ipvs-mh ipvs-rr ipvs-mh-tun none)
+    local labels=(packetbalance packetbalance-generic ipvs-mh ipvs-rr ipvs-mh-tun none)
     local rep label url out
     for ((rep = 1; rep <= REPEATS; rep++)); do
         for label in "${labels[@]}"; do
@@ -224,11 +239,27 @@ exp2() {
             url="http://$VIP/"
             [[ $label == none ]] && url="http://$(real_ip 1)/"
             out="$RUN/wrk.out"
-            log "exp2 $label rep $rep: wrk -t4 -c256 -d${DURATION}s --latency $url"
-            nsx client wrk -t4 -c256 "-d${DURATION}s" --latency "$url" >"$out" 2>&1 || true
-            $LABUTIL wrk "$out" >"$RUN/wrk.json"
+            # Host gate before and after each run (common.sh); a run whose
+            # canary afterwards is below CANARY_MIN goes to rejected.jsonl and
+            # is repeated, up to MEASURE_TRIES runs.
+            local try
+            for ((try = 1; try <= MEASURE_TRIES; try++)); do
+                read -r gate_wait gate_canary < <(host_gate)
+                log "exp2 $label rep $rep: wrk -t4 -c256 -d${DURATION}s --latency $url"
+                nsx client wrk -t4 -c256 "-d${DURATION}s" --latency "$url" >"$out" 2>&1 || true
+                gate_canary_after=$(cpu_canary)
+                $LABUTIL wrk "$out" >"$RUN/wrk.json"
+                ((gate_canary_after >= CANARY_MIN)) && break
+                $LABUTIL row --merge "$RUN/wrk.json" experiment=exp2 "${LF[@]}" "url=$url" \
+                    "cpu_canary:=[$gate_canary, $gate_canary_after]" "cpu_canary_min_required:=$CANARY_MIN" \
+                    host_gate=fail rejected_from=exp2_http.jsonl "repeat:=$rep" "notes=$NOTES" >>"$RESULTS/rejected.jsonl"
+                log "exp2 $label rep $rep: canary after the run $gate_canary_after < $CANARY_MIN, rejected (try $try of $MEASURE_TRIES)"
+            done
+            ((gate_canary_after >= CANARY_MIN)) || { log "exp2 $label rep $rep: every try failed the host gate, no row"; continue; }
             append exp2_http.jsonl --merge "$RUN/wrk.json" experiment=exp2 "${LF[@]}" \
-                "url=$url" "wrk_threads:=4" "wrk_connections:=256" "duration_s:=$DURATION" "repeat:=$rep" \
+                "url=$url" "cpu_canary:=[$gate_canary, $gate_canary_after]" "cpu_canary_min_required:=$CANARY_MIN" \
+                host_gate=pass "quiet_wait_s:=$gate_wait" \
+                "wrk_threads:=4" "wrk_connections:=256" "duration_s:=$DURATION" "repeat:=$rep" \
                 "notes=$([[ $label == none ]] && echo 'direct to real1 only (1 nginx), not 4 reals; ')$NOTES"
         done
     done
@@ -352,7 +383,7 @@ exp6() {
                 continue
             fi
             body=$(check_vip)
-            "$LAB_DIR/measure.sh" --name exp6_conntrack --experiment exp6 --lb packetbalance --lbns lb1 \
+            measure --name exp6_conntrack --experiment exp6 --lb packetbalance --lbns lb1 \
                 --xdp-mode "$PB_XDP_MODE" --hash maglev --conntrack "$ct" --conntrack-size "$size" \
                 --flows 10000 --duration "$DURATION" --repeat "$rep" \
                 --notes "curl via VIP: $body; $mem_note; $NOTES"

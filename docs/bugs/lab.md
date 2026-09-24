@@ -162,3 +162,88 @@ accepted TCP socket is bound to the address the SYN was sent to).
 
 **Fix.** `lab/udp_echo.py` reads the destination address with `IP_PKTINFO` and
 replies from it.
+
+## The committed IPVS baseline measured 121 k, 1.04 M and 2.06 M pps for one configuration
+
+**Symptom.** The three Exp 1 repeats of IPVS `mh` (DR) in the first baseline
+run gave 1.04 M, 2.11 M and 124 k forwarded pps; `rr` 1.93 M, 2.38 M, 132 k;
+the no-LB ceiling 5.94 M, 1.12 M, 5.94 M. A 20x spread inside one configuration.
+
+**Found with.** The per-row `offered_pps` (pktgen itself slowed down, so the
+generator, not the LB, lost speed), then a CPU canary: a fixed single-threaded
+Python loop pinned to one vCPU ran 7 to 12 M iterations/s while the Mac had a
+video call and other apps running, and 15 to 18 M/s after a host reboot. The
+VM's vCPUs are host threads; on Apple silicon they may also land on efficiency
+cores. Nothing inside the VM shows that.
+
+**Cause.** Host contention outside the VM. The harness had no way to see it.
+
+**Fix.** `lab/common.sh host_gate`: before every packet-rate window (and every
+Exp 2 wrk run) wait until no compiler or build runs in the VM and the canary is
+at least `CANARY_MIN` (12 M/s); take the canary again after the window; a
+window that fails goes to `results/rejected.jsonl` and is retried
+(`MEASURE_TRIES`). The canary and the gate result are on every row. The
+pre-guard Exp 1, sweep and Exp 2 baseline rows moved to `results/superseded/`
+and every configuration was measured again with the guard. The spread of the
+new IPVS `mh` rows is 2.10 to 2.28 M.
+
+## PacketBalance's `tx` counter said 1.4 M pps forwarded; 0.6 M arrived
+
+**Symptom.** Exp 1, native XDP: `pbctl stats` `tx` rose by 1.39 to 1.66 M/s, the
+reals received 0.55 to 0.60 M/s. Generic: 2.5 M/s counted, 1.4 M/s received.
+IPVS's InPkts and the reals' receive count agreed within 3%.
+
+**Found with.** A packet accounting added to `lab/measure.sh` (the
+`netdev_delta` and `packet_accounting` row fields): rx/tx packets and dropped
+of every device on the path, `ethtool -S` on lb1's veth0 and on its peer
+pb-lb1, and /proc/net/softnet_stat, all as deltas over the window.
+
+**Cause.** The program's `tx` counts XDP_TX verdicts. On a veth, native XDP_TX
+puts the frame on the peer's (pb-lb1's) 256-entry ptr_ring, and when the ring
+is full `veth_xdp_xmit` drops it; the drop is visible only as lb1 veth0
+`rx_queue_N_xdp_tx_errors` (and `tx_dropped`, and pb-lb1 `rx_dropped`, the same
+event three times). In generic mode XDP_TX goes through the veth's normal
+transmit and shows as lb1 veth0 `tx_dropped`. At saturation, per 30 s window:
+150 M offered, 108 M dropped before the program (lb1's own receive ring full,
+pb-lb1 `tx_dropped`), 42 M XDP_TX'd, 23 M lost to the full pb-lb1 ring, 19 M
+received, 4.5 k dropped by the reals' backlog, 0.3% timing skew. The program's
+own drop counters were 0.
+
+**Fix.** The harness, not the program: every packet-rate row carries
+`received_pps` (what arrived) next to `forwarded_pps` (the LB's own count), the
+driver counters and the accounting, and `lab/render_tables.py` reports received
+pps, and pps per core computed from it, as the headline. The `tx` counter's
+meaning ("XDP_TX verdicts, not frames delivered") is a documentation item for
+docs/API.md (routed to the owner).
+
+## `down.sh` stopped half way: "Cannot find device pb-real4"
+
+**Symptom.** `sudo lab/down.sh` printed `Cannot find device "pb-real4"` and
+exited, leaving br0, the bpffs mount and /run/pblab behind. up.sh's own
+down.sh call then cleaned up, so it went unnoticed.
+
+**Found with.** down.sh's output.
+
+**Cause.** The list of pb-* devices is taken after `ip netns del`, which removes
+the in-namespace ends of the veth pairs asynchronously; the root-side peer can
+vanish between the listing and the `ip link del`, and `set -e` aborted the script.
+
+**Fix.** `ip link del` of a pb-* veth tolerates a device that is already gone.
+
+## The MTU check could not fail: DSR sends the big direction around the LB
+
+**Symptom.** A `curl` of a 100 KB file through the VIP completed with and
+without the client route's `mtu 1480`.
+
+**Found with.** tcpdump on the reals: the encapsulated packets were all
+small (SYN, ACKs, the GET). The 100 KB response goes real -> client directly.
+
+**Cause.** Under DSR only the client-to-real direction is encapsulated, so a
+download never puts a full-size segment through the LB.
+
+**Fix.** The reals' nginx accepts `PUT /upload/` (dav_methods), and
+`lab/mtucheck.sh` uploads 1 MB through the VIP. With the route mtu the largest
+encapsulated TCP payload is 1428 bytes (1500-byte outer packet) and all
+uploads complete in both XDP modes; with `--no-route-mtu` every upload stalls
+at 64 KB and times out (the PMTU black hole in docs/DESIGN.md), with
+`drop_mtu` 0 because the 1520-byte frames are dropped by the veth, not the program.

@@ -109,23 +109,47 @@ def exp1_table(rows, title="Experiment 1: packet rate at saturation"):
            "%s-byte UDP frames (%s-byte skb), %s flows, %s s windows. " %
            (ps, rows[0].get("pkt_size_skb"), rows[0].get("flows"), round(rows[0].get("duration_s") or 0)) +
            provenance(rows), "",
-           "| Configuration | n | Offered pps | Forwarded pps | Received at reals pps | VM CPU busy % | pps per core (est.) |",
-           "|---|---:|---:|---:|---:|---:|---:|"]
+           "| Configuration | n | Offered pps | LB counted pps | Received at reals pps | VM CPU busy % | Received pps per core (est.) | LB drops / veth XDP_TX errors pps |",
+           "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for label, rs in group(rows, config_label).items():
         ok = [r for r in rs if r.get("received_pps") is not None]
         if not ok:
             out.append("| %s | 0 | %s | | | | |" % (label, rs[0].get("notes", "failed")))
             continue
-        out.append("| %s | %d | %s | %s | %s | %s | %s |" % (
+        out.append("| %s | %d | %s | %s | %s | %s | %s | %s |" % (
             label, len(ok),
             spread([r.get("offered_pps") for r in ok], fmt_rate),
             spread([r.get("forwarded_pps") for r in ok], fmt_rate),
             spread([r.get("received_pps") for r in ok], fmt_rate),
             spread([r.get("lb_cpu_util") for r in ok], lambda v: fmt_num(v, 1)),
-            spread([r.get("pps_per_core") for r in ok], fmt_rate)))
-    out += ["", "pps per core = forwarded pps / (busy fraction x CPUs), over the whole VM, which also runs "
-            "the generator and the reals; see results/README.md. For the no-LB row it is received pps."]
+            spread([ppc_received(r) for r in ok], fmt_rate),
+            lb_loss(ok)))
+    out += ["", "Received = frames that arrived at the reals' veth0 (rx_packets), the forwarding number. "
+            "LB counted = PacketBalance's `tx` counter (XDP_TX verdicts) or IPVS InPkts; for native XDP on a "
+            "veth it overstates, because a frame XDP_TX'd into a full peer ring is counted and then lost "
+            "(veth `xdp_tx_errors`, last column). "
+            "pps per core = received pps / (busy fraction x CPUs), over the whole VM, which also runs "
+            "the generator and the reals: an estimate and a lower bound; see results/README.md."]
     return "\n".join(out)
+
+
+def ppc_received(r):
+    if r.get("pps_per_core_received") is not None:
+        return r["pps_per_core_received"]
+    u, c, rx = r.get("lb_cpu_util"), r.get("cpus"), r.get("received_pps")
+    return rx / (u / 100.0 * c) if u and c and rx is not None else None
+
+
+def lb_loss(rows):
+    """PacketBalance drop counters and the LB veth's xdp_tx_errors, per second."""
+    if not any(r.get("lb") == "packetbalance" for r in rows):
+        return "n/a"
+    drops, txerr = [], []
+    for r in rows:
+        w = r.get("duration_s") or 1
+        drops.append(sum((r.get("pb_drops_delta") or {}).values()) / w)
+        txerr.append(((r.get("lb_veth_xdp_delta") or {}).get("xdp_tx_errors") or 0) / w)
+    return "%s / %s" % (spread(drops, fmt_rate), spread(txerr, fmt_rate))
 
 
 def sweep_table(rows):
@@ -139,6 +163,34 @@ def sweep_table(rows):
         out.append("| %s | %s | %s | %s | %s | %s |" % (
             config_label(r), "unthrottled" if not t else fmt_rate(t), fmt_rate(r.get("offered_pps")),
             fmt_rate(r.get("forwarded_pps")), fmt_rate(r.get("received_pps")), fmt_num(r.get("lb_cpu_util"), 1)))
+    return "\n".join(out)
+
+
+def mitigation_table(rows):
+    if not rows:
+        return None
+    out = ["#### Where native XDP on veth loses packets, and lab mitigations (30 s windows)", "",
+           "Same load as the table above. `standard` is the published configuration. `rps-pb-lb1-cpus4-5` "
+           "steers the skb work after pb-lb1 (the LB veth's bridge-side peer) to the two CPUs the generator does "
+           "not use (`rps_cpus` = 0x30); it changes the path for IPVS too, so IPVS is measured under it as well. "
+           "`pktgen-2-threads` halves the generator. Lost before program = pb-lb1 `tx_dropped` (lb1's veth receive "
+           "ring full); lost at XDP_TX = lb1 veth0 `tx_dropped` (peer ring full, `xdp_tx_errors` in native mode).", "",
+           "| Variant | Configuration | n | Offered pps | LB counted pps | Received pps | VM CPU busy % | CPU 4-5 busy % | Received pps per core (est.) | Lost before program pps | Lost at XDP_TX pps |",
+           "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    def acct(r, k):
+        a = r.get("packet_accounting")
+        return a[k] / (r.get("duration_s") or 1) if a and k in a else None
+    for (variant, label), rs in group(rows, lambda r: (r.get("variant", "standard"), config_label(r))).items():
+        out.append("| %s | %s | %d | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            variant, label, len(rs),
+            spread([r.get("offered_pps") for r in rs], fmt_rate),
+            spread([r.get("forwarded_pps") for r in rs], fmt_rate),
+            spread([r.get("received_pps") for r in rs], fmt_rate),
+            spread([r.get("lb_cpu_util") for r in rs], lambda v: fmt_num(v, 1)),
+            spread([(r["per_cpu_util"].get("4", 0) + r["per_cpu_util"].get("5", 0)) / 2 for r in rs], lambda v: fmt_num(v, 0)),
+            spread([ppc_received(r) for r in rs], fmt_rate),
+            spread([acct(r, "dropped_before_lb_program") for r in rs], fmt_rate),
+            spread([acct(r, "lb_veth_tx_dropped") for r in rs], fmt_rate)))
     return "\n".join(out)
 
 
@@ -250,17 +302,18 @@ def exp6_table(rows):
     out = ["### Experiment 6: what the connection table costs", "",
            "Experiment 1's load through PacketBalance with the connection table off and at three sizes. "
            + provenance(rows), "",
-           "| Connection table | n | Forwarded pps | Received pps | VM CPU busy % | pps per core (est.) | Notes |",
-           "|---|---:|---:|---:|---:|---:|---|"]
-    key = lambda r: "off" if r.get("conntrack") is False else "%s flows (--conntrack-size)" % format(r.get("conntrack_size") or 0, ",")
-    for label, rs in group(rows, key).items():
+           "| XDP mode | Connection table | n | LB counted pps | Received at reals pps | VM CPU busy % | Received pps per core (est.) | LB drops / veth XDP_TX errors pps | Notes |",
+           "|---|---|---:|---:|---:|---:|---:|---:|---|"]
+    key = lambda r: (r.get("xdp_mode") or "?",
+                     "off" if r.get("conntrack") is False else "%s flows (--conntrack-size)" % format(r.get("conntrack_size") or 0, ","))
+    for (mode, label), rs in group(rows, key).items():
         ok = [r for r in rs if r.get("forwarded_pps") is not None]
-        notes = "" if ok else (rs[0].get("notes") or "")[:120]
-        out.append("| %s | %d | %s | %s | %s | %s | %s |" % (
-            label, len(ok), spread([r.get("forwarded_pps") for r in ok], fmt_rate),
+        notes = "" if ok else (rs[0].get("notes") or "")[:160]
+        out.append("| %s | %s | %d | %s | %s | %s | %s | %s | %s |" % (
+            mode, label, len(ok), spread([r.get("forwarded_pps") for r in ok], fmt_rate),
             spread([r.get("received_pps") for r in ok], fmt_rate),
             spread([r.get("lb_cpu_util") for r in ok], lambda v: fmt_num(v, 1)),
-            spread([r.get("pps_per_core") for r in ok], fmt_rate), notes))
+            spread([ppc_received(r) for r in ok], fmt_rate), lb_loss(ok) if ok else "", notes))
     return "\n".join(out)
 
 
@@ -269,6 +322,9 @@ def build():
     sw = sweep_table(load("exp1_sweep.jsonl"))
     if t1 and sw:
         t1 = t1 + "\n\n" + sw
+    mt = mitigation_table(load("exp1_mitigations.jsonl"))
+    if t1 and mt:
+        t1 = t1 + "\n\n" + mt
     return collections.OrderedDict([
         ("exp1", t1 or sw),
         ("exp2", exp2_table(load("exp2_http.jsonl"))),

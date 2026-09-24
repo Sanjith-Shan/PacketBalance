@@ -270,7 +270,7 @@ reals_rx_sum() {  # reals_rx_sum <dev> <ns...>
 # and after the window and a row whose minimum canary is below CANARY_MIN is
 # written to results/rejected.jsonl instead, and the window is retried.
 # ---------------------------------------------------------------------------
-CANARY_MIN=${CANARY_MIN:-7000000}
+CANARY_MIN=${CANARY_MIN:-12000000}
 GATE_MAX_WAIT=${GATE_MAX_WAIT:-600}
 BUSY_RE='^(cc1|cc1plus|clang|clang\+\+|clang-[0-9]+|ld|ld\.lld|lld|ninja|make|cmake|ctest|as|c\+\+|g\+\+|gcc|apt|apt-get|dpkg)$'
 vm_busy_procs() { ps -eo comm= | grep -cE "$BUSY_RE" || true; }

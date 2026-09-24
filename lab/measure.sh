@@ -123,6 +123,15 @@ tun_rx_sum() {
     echo "$s"
 }
 now() { date +%s.%N; }
+# Frames that reached a real's veth0 but were dropped there because the real's
+# receive backlog was full (net.core.netdev_max_backlog; /proc/net/softnet_stat
+# column 2 rises with it). They left the LB and crossed the bridge but never
+# reached the real's IP stack, so they are NOT in received_pps.
+reals_rx_dropped() {
+    local s=0 ns v
+    for ns in "${REAL_NS[@]}"; do v=$(nsx "$ns" cat /sys/class/net/veth0/statistics/rx_dropped); s=$((s + v)); done
+    echo "$s"
+}
 
 cleanup() {
     if [[ $generator == pktgen ]]; then "$LAB_DIR/pktgen.sh" --stop client || true; fi
@@ -152,10 +161,31 @@ kill -0 "$gen_pid" 2>/dev/null || { cat "$RUN/pktgen.out" >&2; die "generator ex
 # counters (drops by reason must be on the row, not only tx) and the LB veth's
 # XDP statistics (xdp_tx_errors: frames the program XDP_TX'd that the peer's
 # ring refused; the program already counted them as tx).
+# Plus every netdev on the path (packet accounting): rx/tx packets and dropped
+# of client veth0, the bridge ports, br0, the LB veth0 and each real's veth0,
+# and ethtool -S of the LB veth0 and of its bridge-side peer pb-<lbns>.
+netdev_line() {  # netdev_line <ns|root> <dev>
+    local ns=$1 dev=$2 f v out="$1:$2"
+    for f in rx_packets rx_dropped tx_packets tx_dropped; do
+        if [[ $ns == root ]]; then v=$(cat "/sys/class/net/$dev/statistics/$f" 2>/dev/null || echo 0)
+        else v=$(nsx "$ns" cat "/sys/class/net/$dev/statistics/$f" 2>/dev/null || echo 0); fi
+        out+=" $f=$v"
+    done
+    echo "$out"
+}
 snap() {  # snap <tag>
     if [[ $lb == packetbalance ]]; then pbctl_ns "$lbns" --json stats >"$RUN/pbstats.$1.json" 2>/dev/null || echo '{}' >"$RUN/pbstats.$1.json"
     else echo '{}' >"$RUN/pbstats.$1.json"; fi
     nsx "$lbns" ethtool -S veth0 >"$RUN/ethtool.$1.txt" 2>/dev/null || : >"$RUN/ethtool.$1.txt"
+    ethtool -S "pb-$lbns" >"$RUN/ethtool-peer.$1.txt" 2>/dev/null || : >"$RUN/ethtool-peer.$1.txt"
+    {
+        netdev_line client veth0
+        netdev_line "$lbns" veth0
+        local d ns
+        for d in pb-client "pb-$lbns" "$BR"; do netdev_line root "$d"; done
+        for ns in "${REAL_NS[@]}"; do netdev_line root "pb-$ns"; netdev_line "$ns" veth0; done
+        awk '{ d += strtonum("0x" $2) } END { print "softnet_dropped " d + 0 }' /proc/net/softnet_stat
+    } >"$RUN/netdev.$1.txt"
 }
 # Count seconds with a build running in the VM, and sample the canary.
 ( n=0; cs=""
@@ -167,11 +197,11 @@ snap() {  # snap <tag>
 busy_pid=$!
 snap 0
 read -r f0 tf0 < <(sample_forwarded)
-t0=$(now); s0=$(read_sent); r0=$(reals_rx_sum veth0 "${REAL_NS[@]}"); u0=$(tun_rx_sum)
+t0=$(now); s0=$(read_sent); r0=$(reals_rx_sum veth0 "${REAL_NS[@]}"); u0=$(tun_rx_sum); d0=$(reals_rx_dropped)
 # mpstat covers exactly the window: <duration> one-second samples, then the
 # "Average:" rows are used. The sample count is checked below.
 LC_ALL=C mpstat -P ALL 1 "$duration" >"$RUN/mpstat.out"
-t1=$(now); s1=$(read_sent); r1=$(reals_rx_sum veth0 "${REAL_NS[@]}"); u1=$(tun_rx_sum)
+t1=$(now); s1=$(read_sent); r1=$(reals_rx_sum veth0 "${REAL_NS[@]}"); u1=$(tun_rx_sum); d1=$(reals_rx_dropped)
 read -r f1 tf1 < <(sample_forwarded)
 snap 1
 wait "$busy_pid" 2>/dev/null || true
@@ -182,9 +212,9 @@ trap - EXIT
 canary1=$(cpu_canary)
 
 out="$RESULTS/$name.jsonl"
-T0=$t0 T1=$t1 TF0=$tf0 TF1=$tf1 S0=$s0 S1=$s1 F0=$f0 F1=$f1 R0=$r0 R1=$r1 U0=$u0 U1=$u1 \
+T0=$t0 T1=$t1 TF0=$tf0 TF1=$tf1 S0=$s0 S1=$s1 F0=$f0 F1=$f1 R0=$r0 R1=$r1 U0=$u0 U1=$u1 D0=$d0 D1=$d1 \
 LB=$lb XDP=$xdp_mode HASH=$hash CT=$conntrack CTSIZE=$ct_size FLOWS=$flows DUR=$duration \
-RATE=$rate REPEAT=$repeat EXPERIMENT=${experiment:-${name%%_*}} NOTES=$notes GEN=$generator \
+RATE=$rate REPEAT=$repeat LBNS=$lbns VARIANT=${MEASURE_VARIANT:-standard} EXPERIMENT=${experiment:-${name%%_*}} NOTES=$notes GEN=$generator \
 HOSTDESC=$LAB_HOST DST=$dst PKTSIZE=${PKT_SIZE:-60} THREADS=${PKTGEN_THREADS:-1} MPSTAT="$RUN/mpstat.out" RUNDIR=$RUN \
 QUIET_WAIT=$quiet_wait BUSY_S=$busy_s CANARY="$canary0 $canary1" CANARY_MID="$canary_mid" CANARY_MIN=$CANARY_MIN \
 python3 - >"$RUN/row.json" <<'PY'
@@ -246,6 +276,60 @@ def ethtool(path):
     return tot
 et0, et1 = ethtool("ethtool.0.txt"), ethtool("ethtool.1.txt")
 lb_veth_xdp = {k: et1[k] - et0.get(k, 0) for k in et1 if k.startswith("xdp")} or None
+ep0, ep1 = ethtool("ethtool-peer.0.txt"), ethtool("ethtool-peer.1.txt")
+peer_xdp = {k: ep1[k] - ep0.get(k, 0) for k in ep1 if k.startswith("xdp")} or None
+
+def netdev(path):
+    out = {}
+    try:
+        for line in open(os.path.join(e["RUNDIR"], path)):
+            f = line.split()
+            if f[0] == "softnet_dropped":
+                out["softnet_dropped"] = int(f[1])
+                continue
+            out[f[0]] = {k: int(v) for k, v in (x.split("=") for x in f[1:])}
+    except OSError:
+        pass
+    return out
+nd0, nd1 = netdev("netdev.0.txt"), netdev("netdev.1.txt")
+netdev_delta = {}
+for k, v in nd1.items():
+    if isinstance(v, dict):
+        netdev_delta[k] = {f: v[f] - nd0.get(k, {}).get(f, 0) for f in v}
+    else:
+        netdev_delta[k] = v - nd0.get(k, 0)
+
+# Packet accounting over the window, for PacketBalance: every frame the
+# program XDP_TX'd (its tx counter) must be received by a real or dropped at a
+# named place. Counts, not rates. The windows of the stats snapshot and the
+# netdev snapshot differ by a few ms, so "unaccounted" is small but not 0.
+acct = None
+lbns = e["LBNS"]
+if pb_delta and netdev_delta:
+    reals = [k for k in netdev_delta if k.startswith("real") and k.endswith(":veth0")]
+    rx_reals = sum(netdev_delta[k]["rx_packets"] for k in reals)
+    acct = {
+        # before the program: the bridge-side peer could not hand the frame to
+        # the LB veth (its receive ring was full); the program never saw it
+        "offered_by_client": netdev_delta.get("client:veth0", {}).get("tx_packets", 0),
+        "dropped_before_lb_program": netdev_delta.get("root:pb-" + lbns, {}).get("tx_dropped", 0),
+        "pb_tx": pb_delta.get("tx", 0),
+        "received_at_reals": rx_reals,
+        # the LB veth could not hand an XDP_TX'd / transmitted frame to its
+        # peer (peer ring full). One event, three counters: lb veth0
+        # tx_dropped (native and generic), lb veth0 xdp_tx_errors (native
+        # only) and pb-<lbns> rx_dropped. Only lb_veth_tx_dropped is subtracted.
+        "lb_veth_tx_dropped": netdev_delta.get(lbns + ":veth0", {}).get("tx_dropped", 0),
+        "same_event_lb_veth_xdp_tx_errors": (lb_veth_xdp or {}).get("xdp_tx_errors", 0),
+        "same_event_peer_rx_dropped": netdev_delta.get("root:pb-" + lbns, {}).get("rx_dropped", 0),
+        "peer_xdp_drops": (peer_xdp or {}).get("xdp_drops", 0),
+        # the real's receive backlog was full. Same event as the bridge port's
+        # tx_dropped toward that real; subtracted once.
+        "reals_rx_dropped": sum(netdev_delta[k]["rx_dropped"] for k in reals),
+        "non_vip_pass": pb_delta.get("pass", 0),
+    }
+    acct["unaccounted"] = (acct["pb_tx"] - acct["received_at_reals"] - acct["lb_veth_tx_dropped"]
+                           - acct["peer_xdp_drops"] - acct["reals_rx_dropped"])
 def num(x):
     return None if x in ("null", "", "n/a") else int(x)
 def boolish(x):
@@ -274,6 +358,7 @@ row = {
     "forwarded_pps": forwarded,
     "received_pps": received,
     "received_tunnel_pps": rate("U0", "U1"),
+    "reals_rx_dropped_pps": rate("D0", "D1"),
     "lb_cpu_util": util,
     "softirq_util": soft,
     "per_cpu_util": per_cpu,
@@ -284,12 +369,20 @@ row = {
     "pb_counters_delta": pb_delta,
     "pb_drops_delta": pb_drops,
     "lb_veth_xdp_delta": lb_veth_xdp,
+    "lb_veth_xdp_tx_errors": (lb_veth_xdp or {}).get("xdp_tx_errors"),
+    "lb_veth_xdp_drops": (lb_veth_xdp or {}).get("xdp_drops"),
+    "lb_veth_tx_dropped_pps": round(netdev_delta.get(e["LBNS"] + ":veth0", {}).get("tx_dropped", 0) / win, 1) if netdev_delta else None,
+    "peer_rx_dropped": netdev_delta.get("root:pb-" + e["LBNS"], {}).get("rx_dropped") if netdev_delta else None,
+    "peer_xdp_delta": peer_xdp,
+    "netdev_delta": netdev_delta or None,
+    "packet_accounting": acct,
     "vm_build_seconds_in_window": busy,
     "quiet_wait_s": int(e["QUIET_WAIT"]),
     "cpu_canary": canary,
     "cpu_canary_in_window": [int(x) for x in e["CANARY_MID"].split()],
     "cpu_canary_min_required": int(e["CANARY_MIN"]),
     "host_gate": gate,
+    "variant": e["VARIANT"],
     "date": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     "repeat": int(e["REPEAT"]),
     "notes": e["NOTES"],
