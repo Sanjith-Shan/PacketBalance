@@ -10,9 +10,11 @@ encap_src_prefix: 10.99.0.0/24   # outer IPIP source: prefix | (flow_hash & host
                             # Unset in the lab, where every real is on the same L2 segment
                             # and the daemon resolves each real's MAC from the neighbor table.
 
+icmp_pmtu: false            # forward ICMP fragmentation-needed to the real that owns the inner flow
+
 conntrack:
   enabled: true
-  size: 1048576             # entries per CPU in the LRU, fixed at load time
+  size: 1048576             # total keys in the per-CPU LRU, fixed at load time
 
 socket: /run/packetbalance.sock
 pin_path: /sys/fs/bpf/packetbalance

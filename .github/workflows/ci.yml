@@ -1,0 +1,132 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck lab scripts
+        run: shellcheck -x lab/*.sh
+
+  core:
+    # The portable part: libpb_core (Maglev, flow hash, config), pbctl, the tools
+    # and the Google Test suite. No kernel features needed.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ \
+            libgtest-dev libgmock-dev libyaml-cpp-dev nlohmann-json3-dev
+      - name: build
+        run: |
+          cmake -B build -G Ninja -DPB_BUILD_BPF=OFF -DPB_BUILD_DAEMON=OFF
+          cmake --build build
+      - name: test
+        run: ctest --test-dir build --output-on-failure
+
+  linux-full:
+    # Everything, including the XDP object and the daemon, and the data-plane
+    # BPF_PROG_TEST_RUN tests. Those load BPF programs, so ctest runs as root;
+    # GitHub's ubuntu-24.04 runners allow sudo and BPF.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ pkg-config \
+            clang llvm lld libbpf-dev libelf-dev zlib1g-dev \
+            libgtest-dev libgmock-dev libyaml-cpp-dev nlohmann-json3-dev \
+            linux-tools-common "linux-tools-$(uname -r)" || \
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ pkg-config \
+            clang llvm lld libbpf-dev libelf-dev zlib1g-dev \
+            libgtest-dev libgmock-dev libyaml-cpp-dev nlohmann-json3-dev \
+            linux-tools-common linux-tools-generic
+          bpftool version || ls /usr/lib/linux-tools*/
+      - name: build
+        run: |
+          cmake -B build -G Ninja
+          cmake --build build
+      - name: test (root, includes BPF_PROG_TEST_RUN)
+        run: sudo ctest --test-dir build --output-on-failure
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-linux
+          path: |
+            build/**/packetbalance
+            build/**/pbctl
+            build/**/conncheck
+            build/**/conncheck-server
+            build/**/*.bpf.o
+          if-no-files-found: warn
+
+  e2e:
+    # The lab end to end on the runner's own kernel: namespaces, bridge, reals
+    # with IPIP decap, then curl through IPVS DR and through PacketBalance.
+    #
+    # continue-on-error because the runner kernel is not under our control:
+    # the Azure-flavoured kernel may ship ipip, ip_vs or pktgen only in a
+    # linux-modules-extra package that is not always installable for the
+    # running version, and native XDP on veth depends on the kernel build.
+    # Every missing piece is reported with a SKIP line instead of silently
+    # passing. The authoritative end-to-end run is the Lima VM (docs/DEVELOPING.md).
+    needs: linux-full
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ pkg-config \
+            clang llvm lld libbpf-dev libelf-dev zlib1g-dev \
+            libgtest-dev libgmock-dev libyaml-cpp-dev nlohmann-json3-dev \
+            ipvsadm nginx-light wrk sysstat tcpdump ethtool jq curl python3 iproute2
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || echo "SKIP: no linux-modules-extra for $(uname -r)"
+          sudo systemctl disable --now nginx || true
+      - name: build
+        run: |
+          cmake -B build -G Ninja
+          cmake --build build || cmake --build build --target conncheck conncheck-server
+      - name: modules
+        id: mods
+        run: |
+          for m in ipip ip_vs ip_vs_mh ip_vs_rr pktgen; do
+            if sudo modprobe "$m"; then echo "$m=1" >> "$GITHUB_OUTPUT"; else echo "SKIP: module $m unavailable"; echo "$m=0" >> "$GITHUB_OUTPUT"; fi
+          done
+      - name: lab up
+        if: steps.mods.outputs.ipip == '1'
+        run: sudo LAB_SKIP_BUILD=1 LAB_HOST="GitHub Actions ubuntu-24.04 runner" lab/up.sh
+      - name: curl through IPVS (DR, mh)
+        if: steps.mods.outputs.ipip == '1' && steps.mods.outputs.ip_vs_mh == '1'
+        run: |
+          sudo lab/ipvs.sh lb1 up mh
+          for i in 1 2 3 4 5 6 7 8; do sudo ip netns exec client curl -sf --max-time 3 http://198.51.100.1/; done | tee /tmp/ipvs.txt
+          grep -q '^real' /tmp/ipvs.txt
+          sudo lab/ipvs.sh lb1 down
+      - name: curl through PacketBalance (native XDP, then generic)
+        if: steps.mods.outputs.ipip == '1'
+        run: |
+          set -euo pipefail
+          source lab/common.sh
+          if ! find_bin packetbalance >/dev/null; then echo "SKIP: daemon not built"; exit 0; fi
+          sudo bash -c 'source lab/common.sh; write_pb_config lb1 maglev true 65536 >/dev/null
+            pb_start lb1 native --detach-on-exit || { pb_stop lb1; pb_start lb1 generic --detach-on-exit; }'
+          for i in 1 2 3 4 5 6 7 8; do sudo ip netns exec client curl -sf --max-time 3 http://198.51.100.1/; done | tee /tmp/pb.txt
+          grep -q '^real' /tmp/pb.txt
+          sudo bash -c 'source lab/common.sh; pb_stop lb1'
+      - name: pktgen smoke test
+        if: steps.mods.outputs.ipip == '1' && steps.mods.outputs.pktgen == '1'
+        run: sudo lab/pktgen.sh client veth0 10.0.0.21 5000 10000 100
+      - name: diagnose on failure
+        if: failure()
+        run: sudo lab/diagnose.sh lb1 || true
+      - name: lab down
+        if: always()
+        run: sudo lab/down.sh || true

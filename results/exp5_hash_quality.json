@@ -1,0 +1,39 @@
+{
+  "experiment": "exp5_hash_quality",
+  "date": "2026-09-24",
+  "ring_size": 65537,
+  "tuples": 1000000,
+  "seed": 5,
+  "vip": "198.51.100.1:80/tcp",
+  "hash": "pb_flow_hash (jhash 3 words, include/packetbalance/hash.h)",
+  "modes": [
+    {
+      "mode": "maglev",
+      "build_ms": 1.234,
+      "shares": [
+        {"real": "10.0.0.21", "weight": 1, "expected": 0.125000, "observed": 0.125188, "deviation": 0.000188},
+        {"real": "10.0.0.22", "weight": 1, "expected": 0.125000, "observed": 0.124967, "deviation": -0.000033},
+        {"real": "10.0.0.23", "weight": 2, "expected": 0.250000, "observed": 0.250536, "deviation": 0.000536},
+        {"real": "10.0.0.24", "weight": 4, "expected": 0.500000, "observed": 0.499309, "deviation": -0.000691}
+      ],
+      "disruption": [
+        {"event": "remove 10.0.0.23 (w=2)", "target": 0.250000, "flows_moved": 0.250940, "slots_moved": 0.250408},
+        {"event": "add 10.0.0.25 (w=1)", "target": 0.111111, "flows_moved": 0.111078, "slots_moved": 0.111738}
+      ]
+    },
+    {
+      "mode": "modulo",
+      "build_ms": 0.057,
+      "shares": [
+        {"real": "10.0.0.21", "weight": 1, "expected": 0.125000, "observed": 0.124706, "deviation": -0.000294},
+        {"real": "10.0.0.22", "weight": 1, "expected": 0.125000, "observed": 0.124844, "deviation": -0.000156},
+        {"real": "10.0.0.23", "weight": 2, "expected": 0.250000, "observed": 0.250108, "deviation": 0.000108},
+        {"real": "10.0.0.24", "weight": 4, "expected": 0.500000, "observed": 0.500342, "deviation": 0.000342}
+      ],
+      "disruption": [
+        {"event": "remove 10.0.0.23 (w=2)", "target": 0.250000, "flows_moved": 0.583609, "slots_moved": 0.583350},
+        {"event": "add 10.0.0.25 (w=1)", "target": 0.111111, "flows_moved": 0.694093, "slots_moved": 0.694341}
+      ]
+    }
+  ]
+}

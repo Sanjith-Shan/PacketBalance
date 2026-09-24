@@ -5,7 +5,7 @@
 #pragma once
 
 #include <cstdint>
-#include <cstdio>
+#include <cctype>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -16,18 +16,41 @@ namespace pb {
 
 // Parses dotted-quad IPv4 to network byte order. Throws std::invalid_argument.
 inline uint32_t parse_ipv4(const std::string& s) {
-    unsigned a, b, c, d;
-    char tail;
-    if (std::sscanf(s.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4 ||
-        a > 255 || b > 255 || c > 255 || d > 255)
-        throw std::invalid_argument("bad IPv4 address: " + s);
-    uint32_t host = (a << 24) | (b << 16) | (c << 8) | d;
-    // to network byte order without <arpa/inet.h> so this builds everywhere
-    unsigned char be[4] = {(unsigned char)a, (unsigned char)b, (unsigned char)c, (unsigned char)d};
+    // Strict: exactly four decimal octets, digits only, no sign, no whitespace.
+    unsigned char be[4];
+    size_t pos = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (pos >= s.size() || !std::isdigit((unsigned char)s[pos]))
+            throw std::invalid_argument("bad IPv4 address: " + s);
+        unsigned v = 0;
+        size_t start = pos;
+        while (pos < s.size() && std::isdigit((unsigned char)s[pos])) {
+            v = v * 10 + (unsigned)(s[pos] - '0');
+            if (v > 255 || pos - start >= 3) throw std::invalid_argument("bad IPv4 address: " + s);
+            ++pos;
+        }
+        be[i] = (unsigned char)v;
+        if (i < 3) {
+            if (pos >= s.size() || s[pos] != '.') throw std::invalid_argument("bad IPv4 address: " + s);
+            ++pos;
+        }
+    }
+    if (pos != s.size()) throw std::invalid_argument("bad IPv4 address: " + s);
     uint32_t out;
     std::memcpy(&out, be, 4);
-    (void)host;
     return out;
+}
+
+// Strict decimal port 1..65535, digits only.
+inline uint16_t parse_port(const std::string& s) {
+    if (s.empty() || s.size() > 5) throw std::invalid_argument("bad port: " + s);
+    unsigned v = 0;
+    for (char ch : s) {
+        if (!std::isdigit((unsigned char)ch)) throw std::invalid_argument("bad port: " + s);
+        v = v * 10 + (unsigned)(ch - '0');
+    }
+    if (v < 1 || v > 65535) throw std::invalid_argument("bad port: " + s);
+    return (uint16_t)v;
 }
 
 inline std::string ipv4_to_string(uint32_t addr_be) {
@@ -62,9 +85,7 @@ struct VipSpec {
             throw std::invalid_argument("bad VIP, want ADDR:PORT/PROTO: " + s);
         VipSpec v;
         v.addr_be = parse_ipv4(s.substr(0, colon));
-        int port = std::stoi(s.substr(colon + 1, slash - colon - 1));
-        if (port < 1 || port > 65535) throw std::invalid_argument("bad port in VIP: " + s);
-        v.port_be = port_to_be((uint16_t)port);
+        v.port_be = port_to_be(parse_port(s.substr(colon + 1, slash - colon - 1)));
         std::string proto = s.substr(slash + 1);
         if (proto == "tcp") v.proto = 6;
         else if (proto == "udp") v.proto = 17;

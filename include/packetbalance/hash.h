@@ -7,9 +7,12 @@
  * ring slot, and the control plane's hash-quality experiment (Experiment 5)
  * is only meaningful if it uses the data plane's hash.
  *
- * This is Bob Jenkins' lookup3 "jhash" as the Linux kernel uses it
- * (include/linux/jhash.h), three-word variant. Inputs are taken in network
- * byte order exactly as stored in struct pb_ct_key.
+ * This is the final mixing step of Bob Jenkins' lookup3 hash, the same mix the
+ * Linux kernel's jhash_3words uses (include/linux/jhash.h). It is NOT
+ * bit-identical to the kernel's jhash_3words, which also adds
+ * (initval + JHASH_INITVAL + 12) before mixing. That does not matter: the only
+ * requirement is that both planes use this one function. Inputs are taken in
+ * network byte order exactly as stored in struct pb_ct_key.
  */
 #ifndef PACKETBALANCE_HASH_H
 #define PACKETBALANCE_HASH_H

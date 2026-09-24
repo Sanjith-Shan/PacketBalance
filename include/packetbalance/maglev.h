@@ -40,6 +40,7 @@ const char* hash_mode_name(HashMode m);
 // Every backend with weight > 0 gets a share of slots within 1% of
 // weight / sum(weights) (Maglev), or within one slot per backend (Modulo).
 // If no backend has weight > 0 every slot is PB_REAL_NONE.
+// Throws std::invalid_argument if two weighted backends share an address.
 std::vector<uint32_t> build_ring(const std::vector<Backend>& backends,
                                  HashMode mode,
                                  uint32_t ring_size = PB_RING_SIZE);

@@ -1,0 +1,41 @@
+# systemd unit for the PacketBalance control-plane daemon.
+#
+# Install (from a build directory, as root):
+#   install -m 0755 build/src/daemon/packetbalance /usr/local/sbin/packetbalance
+#   install -m 0755 build/src/pbctl/pbctl          /usr/local/bin/pbctl
+#   install -d /etc/packetbalance
+#   install -m 0644 deploy/packetbalance.yaml      /etc/packetbalance/packetbalance.yaml
+#   install -m 0644 deploy/packetbalance.service   /etc/systemd/system/packetbalance.service
+#   systemctl daemon-reload
+#   systemctl enable --now packetbalance
+#   journalctl -u packetbalance -f          # logs (stderr, ISO 8601 timestamps)
+#   systemctl reload packetbalance          # re-read the YAML (pbctl reload)
+#
+# Stopping or restarting the unit does NOT take the load balancer down: the
+# XDP program stays attached and the maps stay pinned under
+# /sys/fs/bpf/packetbalance, so traffic keeps flowing and a restart keeps every
+# tracked flow. To tear it down, stop the unit and run the daemon once with
+# --detach-on-exit, or `ip link set dev IFACE xdp off` and remove the pins.
+
+[Unit]
+Description=PacketBalance XDP Layer 4 load balancer (control plane)
+Documentation=file:///usr/local/share/doc/packetbalance/API.md
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/packetbalance --config /etc/packetbalance/packetbalance.yaml
+ExecReload=/usr/local/bin/pbctl reload
+Restart=on-failure
+RestartSec=1s
+# Loading BPF programs, attaching XDP and pinning in bpffs need root (or
+# CAP_BPF + CAP_NET_ADMIN + CAP_SYS_ADMIN for map-by-id reads in ring.show).
+User=root
+# SIGTERM: the daemon stops its threads and exits, leaving the data plane up.
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
