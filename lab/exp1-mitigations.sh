@@ -14,7 +14,7 @@ set -uo pipefail
 # shellcheck source=lab/common.sh
 source "$(dirname "$0")/common.sh"
 need_root
-cd "$REPO"
+cd "$REPO" || exit 1
 C=${NOTES:-}
 REPS=${REPS:-3}
 start_plane() {  # native|generic|ipvs-mh
@@ -27,16 +27,18 @@ start_plane() {  # native|generic|ipvs-mh
 m() {  # m <plane> <variant>
   local plane=$1 v=$2 lbl xm h
   case $plane in native|generic) lbl=packetbalance; xm=$plane; h=maglev ;; *) lbl=$plane; xm=n/a; h=mh ;; esac
+  local ctsize=null
+  [[ $lbl == packetbalance ]] && ctsize=1048576
   for ((r=1; r<=REPS; r++)); do
     MEASURE_VARIANT=$v "$LAB_DIR/measure.sh" --name exp1_mitigations --experiment exp1 --lb $lbl --lbns lb1 --xdp-mode $xm --hash $h \
-      --conntrack true --conntrack-size $([[ $lbl == packetbalance ]] && echo 1048576 || echo null) --flows 10000 --duration 30 --repeat $r \
+      --conntrack true --conntrack-size "$ctsize" --flows 10000 --duration 30 --repeat $r \
       --notes "variant=$v; $C" 2>&1 | grep -E 'gate|FATAL' ; done
 }
 rps() {  # rps <hexmask|0>
   for q in /sys/class/net/pb-lb1/queues/rx-*/rps_cpus; do echo $1 > $q; done
 }
 case ${1:-} in
-standard) for p in native; do start_plane $p; PKTGEN_THREADS=4 m $p standard; done ;;
+standard) start_plane native; PKTGEN_THREADS=4 m native standard ;;
 rps) rps 30; for p in native generic ipvs-mh; do start_plane $p; PKTGEN_THREADS=4 m $p rps-pb-lb1-cpus4-5; done; rps 0 ;;
 pg2) for p in native generic ipvs-mh; do start_plane $p; PKTGEN_THREADS=2 m $p pktgen-2-threads; done ;;
 esac
