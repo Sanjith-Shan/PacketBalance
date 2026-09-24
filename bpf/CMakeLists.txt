@@ -17,9 +17,17 @@ endif()
 
 # clang -target bpf does not search the multiarch include directory, where
 # Debian/Ubuntu keep <asm/types.h> (pulled in by <linux/types.h>).
+# The triplet comes from CMake's C compiler detection (aarch64-linux-gnu,
+# x86_64-linux-gnu), falling back to asking the host compiler.
 set(PB_BPF_SYS_INCLUDES)
-if(CMAKE_LIBRARY_ARCHITECTURE AND EXISTS /usr/include/${CMAKE_LIBRARY_ARCHITECTURE})
-  list(APPEND PB_BPF_SYS_INCLUDES -idirafter /usr/include/${CMAKE_LIBRARY_ARCHITECTURE})
+set(PB_MULTIARCH "${CMAKE_LIBRARY_ARCHITECTURE}")
+if(NOT PB_MULTIARCH)
+  execute_process(COMMAND ${CMAKE_C_COMPILER} -print-multiarch
+                  OUTPUT_VARIABLE PB_MULTIARCH OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET)
+endif()
+if(PB_MULTIARCH AND EXISTS /usr/include/${PB_MULTIARCH})
+  list(APPEND PB_BPF_SYS_INCLUDES -idirafter /usr/include/${PB_MULTIARCH})
 endif()
 
 set(PB_BPF_SRC ${CMAKE_CURRENT_SOURCE_DIR}/packetbalance.bpf.c)

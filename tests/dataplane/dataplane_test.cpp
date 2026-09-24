@@ -565,6 +565,32 @@ TEST_F(Dataplane, PerVipNoConntrackFlag)
     expect_encap(ack, run(ack), kRealB);
 }
 
+// A flow pinned to a real that is then deleted (reals[id].addr = 0, id
+// freed) must move to the live ring owner at once, counted as a miss, and
+// the entry must be rewritten, not black-holed until LRU eviction.
+TEST_F(Dataplane, ConntrackEntryForDeletedRealRehashes)
+{
+    set_ring_all(kTcpVipId, kRealA);
+    auto syn = tcp_frame(kClient, 40011, kVip, 80, kTcpSyn);
+    expect_encap(syn, run(syn), kRealA);
+
+    // Control plane removes real A: clears its slot and rebuilds the ring.
+    pb_real gone{0, 0};
+    uint32_t id = kRealA;
+    ASSERT_EQ(bpf_map_update_elem(fd(skel_->maps.reals), &id, &gone, BPF_ANY), 0);
+    set_ring_all(kTcpVipId, kRealB);
+
+    auto ack = tcp_frame(kClient, 40011, kVip, 80, kTcpAck);
+    expect_encap(ack, run(ack), kRealB);
+    EXPECT_EQ(counter(kTcpVipId, PB_CNT_CT_MISS), 1u);
+    EXPECT_EQ(counter(kTcpVipId, PB_CNT_CT_HIT), 0u);
+    EXPECT_EQ(counter(kTcpVipId, PB_CNT_DROP_NO_REAL), 0u);
+    EXPECT_EQ(ct_real(kClient, 40011, kVip, 80, IPPROTO_TCP), kRealB) << "entry overwritten";
+    // And from now on it is an ordinary hit on B.
+    expect_encap(ack, run(ack), kRealB);
+    EXPECT_EQ(counter(kTcpVipId, PB_CNT_CT_HIT), 1u);
+}
+
 TEST_F(Dataplane, TcpMidFlowMissHashesAndInserts)
 {
     // An ACK for a flow this LB never saw (e.g. after failover from another

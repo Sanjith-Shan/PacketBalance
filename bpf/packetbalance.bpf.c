@@ -180,6 +180,14 @@ static __always_inline __u32 ring_lookup(__u32 vip_id, __u32 hash)
     return *rid;
 }
 
+static __always_inline int real_alive(__u32 real_id)
+{
+    if (real_id >= PB_MAX_REALS)
+        return 0;
+    struct pb_real *r = bpf_map_lookup_elem(&reals, &real_id);
+    return r && r->addr != 0;
+}
+
 // Pick the real for a flow.
 //
 //   use_ct     connection table enabled for this VIP and daemon-wide
@@ -226,7 +234,15 @@ static __always_inline __u32 pick_real(const struct pb_flow *f, __u32 vip_id,
         // after boot, so last_seen_ns == 0 is the marker of that case and it
         // falls through to the hash, which is deterministic and picks the
         // same real as CPU A did unless the ring changed.
-        if (ct && ct->last_seen_ns != 0) {
+        //
+        // An entry whose real has since been deleted (reals[id].addr == 0,
+        // the id freed by the control plane) is stale: treat it as a miss so
+        // the flow moves to a live real now and the entry is overwritten
+        // below, instead of black-holing until the LRU evicts it. The
+        // connection was already broken when its backend went away; this
+        // makes the client find out by RST from the new real rather than by
+        // timeout.
+        if (ct && ct->last_seen_ns != 0 && real_alive(ct->real_id)) {
             ct->last_seen_ns = bpf_ktime_get_ns();
             if (st)
                 st->c[PB_CNT_CT_HIT]++;
