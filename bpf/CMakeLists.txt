@@ -4,7 +4,20 @@
 # link it.
 
 find_program(PB_CLANG NAMES clang clang-18 clang-17 clang-16 clang-15 REQUIRED)
+# Ubuntu's /usr/sbin/bpftool is a wrapper that dispatches on `uname -r` and fails
+# when the running kernel has no linux-tools package (GitHub's Azure kernels, for
+# example). Prefer a real versioned binary under /usr/lib/linux-tools when present.
+file(GLOB PB_BPFTOOL_VERSIONED /usr/lib/linux-tools/*/bpftool /usr/lib/linux-tools-*/bpftool)
+if(PB_BPFTOOL_VERSIONED)
+  list(GET PB_BPFTOOL_VERSIONED -1 PB_BPFTOOL_DEFAULT)
+  set(PB_BPFTOOL ${PB_BPFTOOL_DEFAULT} CACHE FILEPATH "bpftool binary")
+endif()
 find_program(PB_BPFTOOL NAMES bpftool REQUIRED)
+execute_process(COMMAND ${PB_BPFTOOL} version RESULT_VARIABLE PB_BPFTOOL_RC OUTPUT_QUIET ERROR_QUIET)
+if(NOT PB_BPFTOOL_RC EQUAL 0)
+  message(FATAL_ERROR "${PB_BPFTOOL} does not run. Install linux-tools-generic and pass -DPB_BPFTOOL=/usr/lib/linux-tools/<ver>/bpftool")
+endif()
+message(STATUS "bpftool: ${PB_BPFTOOL}")
 
 execute_process(COMMAND uname -m OUTPUT_VARIABLE PB_UNAME_M OUTPUT_STRIP_TRAILING_WHITESPACE)
 if(PB_UNAME_M STREQUAL "aarch64" OR PB_UNAME_M STREQUAL "arm64")
