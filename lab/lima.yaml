@@ -1,0 +1,44 @@
+# PacketBalance lab VM. Ubuntu 24.04 aarch64 on the Lima virtualization framework.
+#
+#   limactl start --name=packetbalance lab/lima.yaml
+#   limactl shell packetbalance
+#
+# The repo is mounted writable at the same path as on the host, so `cmake` and the
+# lab scripts run in-place. Everything network related (namespaces, veths, bridge,
+# XDP) lives inside this VM. Nothing here touches the host's network.
+vmType: "vz"
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+cpus: 6
+memory: "8GiB"
+disk: "30GiB"
+mounts:
+  - location: "~/Documents/PacketBalance"
+    writable: true
+  - location: "/tmp/lima"
+    writable: true
+mountType: "virtiofs"
+containerd:
+  system: false
+  user: false
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build pkg-config git \
+        clang llvm lld libbpf-dev libelf-dev zlib1g-dev \
+        linux-tools-common "linux-tools-$(uname -r)" \
+        libgtest-dev libgmock-dev libyaml-cpp-dev nlohmann-json3-dev \
+        ipvsadm iproute2 iputils-ping tcpdump bpftrace ethtool \
+        nginx-light iperf3 wrk sysstat curl jq python3 python3-venv \
+        "linux-modules-extra-$(uname -r)" socat netcat-openbsd
+      systemctl disable --now nginx || true
+      # The lab attaches XDP programs and creates namespaces as root.
+      echo "packetbalance lab provisioned: $(uname -r)"

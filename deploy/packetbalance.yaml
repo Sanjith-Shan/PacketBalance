@@ -1,0 +1,53 @@
+# PacketBalance daemon configuration. This is the lab's lb1 config; lab/up.sh
+# generates the real one from this template.
+
+interface: veth0            # interface the XDP program attaches to
+xdp_mode: auto              # native | generic | auto (native, then generic)
+hash: maglev                # maglev | modulo (modulo is the naive baseline)
+
+encap_src_prefix: 10.99.0.0/24   # outer IPIP source: prefix | (flow_hash & host bits)
+# next_hop: 10.0.0.1        # L3 deployment: encapsulated frames go to this router's MAC.
+                            # Unset in the lab, where every real is on the same L2 segment
+                            # and the daemon resolves each real's MAC from the neighbor table.
+
+conntrack:
+  enabled: true
+  size: 1048576             # entries per CPU in the LRU, fixed at load time
+
+socket: /run/packetbalance.sock
+pin_path: /sys/fs/bpf/packetbalance
+
+metrics:
+  listen: 127.0.0.1:9101
+
+health_check:
+  interval_ms: 1000
+  timeout_ms: 500
+  fall: 3                   # consecutive failures before a real is marked down
+  rise: 2                   # consecutive successes before it is marked up
+
+vips:
+  - address: 198.51.100.1
+    port: 80
+    proto: tcp
+    reals:
+      - { address: 10.0.0.21, weight: 1 }
+      - { address: 10.0.0.22, weight: 1 }
+      - { address: 10.0.0.23, weight: 1 }
+      - { address: 10.0.0.24, weight: 1 }
+  - address: 198.51.100.1
+    port: 5000
+    proto: udp
+    reals:
+      - { address: 10.0.0.21, weight: 1 }
+      - { address: 10.0.0.22, weight: 1 }
+      - { address: 10.0.0.23, weight: 1 }
+      - { address: 10.0.0.24, weight: 1 }
+  - address: 198.51.100.1
+    port: 7000
+    proto: tcp
+    reals:
+      - { address: 10.0.0.21, weight: 1 }
+      - { address: 10.0.0.22, weight: 1 }
+      - { address: 10.0.0.23, weight: 1 }
+      - { address: 10.0.0.24, weight: 1 }

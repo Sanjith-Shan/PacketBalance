@@ -1,0 +1,10 @@
+build*/
+.cache/
+compile_commands.json
+*.o
+*.skel.h
+__pycache__/
+*.pyc
+.venv/
+results/tmp/
+*.pcap
