@@ -187,6 +187,23 @@ and is started again at t=15 s. `flows_tracked_before` /
 table (`pbctl flows`); `xdp_while_daemon_down` is the program still attached
 while no daemon ran.
 
+### Exp 3 `add`: why PacketBalance with its connection table still broke 0.2 to 3.5%
+
+The connection table is an LRU_PERCPU_HASH: a flow's entry lives only on the
+CPUs that have seen its packets. On a veth the XDP program runs on the CPU that
+transmitted the frame, i.e. wherever the conncheck thread sending that
+heartbeat was scheduled. When a heartbeat of an established flow arrives on a
+CPU with no entry for it, the program falls back to the hash, and while real5
+is in the ring about 1/5 of those flows hash to real5, which answers the
+unknown ACK with a RST (`broken_by_cause.rst`; `broken_by_backend` shows them
+spread over real1..real4, the reals they were on). The number of broken flows
+therefore depends on how many flows changed CPU during the 10 s real5 was in the
+ring (20, 315 and 350 in the three repeats). IPVS keeps one shared connection
+table and broke 0. Without the table (no conntrack) Maglev broke 20 to 35%,
+the 1/(N+1) = 20% the hash must move plus flows caught by the second ring change
+at t=20 s. This is the per-CPU LRU trade-off that docs/DESIGN.md describes,
+measured.
+
 ## conncheck rows (Exp 3, Exp 4)
 
 The row is `conncheck --json` output merged with the configuration fields.
@@ -205,7 +222,9 @@ The row is `conncheck --json` output merged with the configuration fields.
 | `timeline` | per second since start: broken total and by cause (seconds with none omitted at the tail) |
 | `ramp_complete_s` | when every connect had resolved and every connection had its first id |
 | `heartbeat_ms`, `timeout_ms`, `duration_s` | instrument settings |
-| Exp 3: `removed_real`, `removed_backend_id`, `events` | real3 removed at t=10 s, added at t=20 s |
+| Exp 3: `scenario` | `remove`: real3 removed at t=10 s and added back at t=20 s. `add`: real5 (not in the configuration) added at t=10 s and removed at t=20 s, on live traffic to real1..real4. The `remove` rows measured before the field existed got `scenario: "remove"` added by a one-off script (their `events` field says the same) |
+| Exp 3 remove: `removed_real`, `removed_backend_id`, `events` | real3 removed at t=10 s, added at t=20 s |
+| Exp 3 add: `added_real`, `added_backend_id`, `min_fraction_moved`, `events` | real5 added at t=10 s, removed at t=20 s; 0.2 = 1/(N+1), what a consistent hash alone must move |
 | Exp 4: `drift`, `reals_lb1`, `reals_lb2`, `min_fraction_moved`, `events` | route flip at t=10 s; drift adds real5 on lb2 only; `min_fraction_moved` = 1/(N+1) = 0.2 is the least any hash can move when a fifth real appears |
 | Exp 4 IPVS: `ipvs_sloppy_tcp` | `net.ipv4.vs.sloppy_tcp` on both directors. With 0, a director that never saw the SYN does not schedule a flow at all (see `lab/ipvs.sh`) |
 

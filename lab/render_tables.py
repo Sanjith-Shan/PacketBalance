@@ -221,6 +221,39 @@ def cause(r, k):
 def exp3_table(rows):
     if not rows:
         return None
+    remove = [r for r in rows if r.get("scenario", "remove") == "remove"]
+    add = [r for r in rows if r.get("scenario") == "add"]
+    parts = [t for t in (exp3_remove_table(remove), exp3_add_table(add)) if t]
+    return "\n\n".join(parts) if parts else None
+
+
+def exp3_add_table(rows):
+    if not rows:
+        return None
+    out = ["#### Adding a backend to live traffic (scenario `add`)", "",
+           "conncheck holds 10,000 connections on real1..real4. real5 is added at t=10 s and removed at t=20 s. "
+           "Correct: nothing breaks, because the connection table keeps every existing flow on its real; a hash "
+           "alone moves at least 1/5 of them to real5 (Maglev about 20%, modulo more). " + provenance(rows), "",
+           "| Configuration | n | Established | Broken | Broken % | Minimum a hash alone moves % | On real5 at end | rst / eof / timeout / wrong backend |",
+           "|---|---:|---:|---:|---:|---:|---:|---|"]
+    f = lambda v: "%.0f" % v
+    for label, rs in group(rows, config_label).items():
+        ok = [r for r in rs if "broken" in r]
+        if not ok:
+            out.append("| %s | 0 | %s | | | | | |" % (label, rs[0].get("notes", "failed")))
+            continue
+        pct = [100.0 * r["broken"] / r["established"] for r in ok if r.get("established")]
+        causes = " / ".join(spread([cause(r, k) for r in ok], f) for k in ("rst", "eof", "timeout", "wrong_backend"))
+        out.append("| %s | %d | %s | %s | %s | %s | %s | %s |" % (
+            label, len(ok), spread([r.get("established") for r in ok], f), spread([r["broken"] for r in ok], f),
+            spread(pct, lambda v: "%.1f" % v), "%.0f" % (100 * (ok[0].get("min_fraction_moved") or 0.2)),
+            spread([(r.get("backends_at_end") or {}).get("5", 0) for r in ok], f), causes))
+    return "\n".join(out)
+
+
+def exp3_remove_table(rows):
+    if not rows:
+        return None
     out = ["### Experiment 3: connection survival through backend churn", "",
            "conncheck holds 10,000 TCP connections (heartbeat 100 ms, timeout 2 s). real3 is removed at t=10 s "
            "and added back at t=20 s. Correct: only the connections on real3 break. " + provenance(rows), "",

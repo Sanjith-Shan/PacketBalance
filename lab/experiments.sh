@@ -16,6 +16,8 @@
 #   PB_XDP_MODE=native XDP mode for Exp 2, 3, 4, 6
 #   NOTES="..."        appended to every row's notes
 #   PKTGEN_THREADS=4   pktgen kernel threads for Exp 1 and 6
+#   EXP3_SCENARIOS="remove add"  Exp 3 scenarios: remove (real3 out and back) and/or add (real5 in and out)
+#   EXP2_DONE="1:ipvs-mh ..."  Exp 2 runs (repeat:label) to skip when resuming
 #   EXP6_DONE="1:false:1048576 ..."  Exp 6 windows (repeat:conntrack:size) to skip when resuming
 #
 # PacketBalance configurations are skipped (with a log line) when the daemon or
@@ -233,6 +235,8 @@ exp2() {
     for ((rep = 1; rep <= REPEATS; rep++)); do
         for label in "${labels[@]}"; do
             wanted "$label" || continue
+            # EXP2_DONE="rep:label ..." skips runs already measured (resume)
+            if [[ " ${EXP2_DONE:-} " == *" $rep:$label "* ]]; then log "exp2: skip $rep:$label (EXP2_DONE)"; continue; fi
             set_lf "$label"
             all_lbs_off; route_via lb1
             setup_label "$label" lb1 1048576 || { append exp2_http.jsonl experiment=exp2 \
@@ -297,24 +301,43 @@ run_conncheck() {
 # ===========================================================================
 exp3() {
     local labels=(packetbalance packetbalance-noct packetbalance-modulo ipvs-mh ipvs-rr)
-    local rep label removed
-    removed=$(real_ip 3)
+    local rep label removed added scenario
+    removed=$(real_ip 3); added=$(real_ip 5)
+    for scenario in ${EXP3_SCENARIOS:-remove add}; do
     for ((rep = 1; rep <= REPEATS; rep++)); do
         for label in "${labels[@]}"; do
             wanted "$label" || continue
+            # The add scenario is not run for IPVS rr (round robin has no
+            # hash to disturb; its connection table alone decides).
+            [[ $scenario == add && $label == ipvs-rr ]] && continue
             set_lf "$label"
             all_lbs_off; route_via lb1
             setup_label "$label" lb1 1048576 || { append exp3_churn.jsonl experiment=exp3 \
-                "${LF[@]}" "repeat:=$rep" "notes=forwarding plane failed to start"; continue; }
-            run_conncheck "$RUN/cc.json" 30 \
-                10 "real_del $label lb1 $removed" \
-                20 "real_add $label lb1 $removed"
-            append exp3_churn.jsonl --merge "$RUN/cc.json" experiment=exp3 "${LF[@]}" \
-                "removed_real=$removed" "removed_backend_id:=3" \
-                "events=real del $removed at t=10s, real add at t=20s, end t=30s" \
-                "repeat:=$rep" "notes=$NOTES"
+                "${LF[@]}" "scenario=$scenario" "repeat:=$rep" "notes=forwarding plane failed to start"; continue; }
+            if [[ $scenario == remove ]]; then
+                run_conncheck "$RUN/cc.json" 30 \
+                    10 "real_del $label lb1 $removed" \
+                    20 "real_add $label lb1 $removed"
+                append exp3_churn.jsonl --merge "$RUN/cc.json" experiment=exp3 "${LF[@]}" scenario=remove \
+                    "removed_real=$removed" "removed_backend_id:=3" \
+                    "events=real del $removed at t=10s, real add at t=20s, end t=30s" \
+                    "repeat:=$rep" "notes=$NOTES"
+            else
+                # A fifth real (real5, id 5, serving :7000) joins live traffic
+                # on reals 1-4 at t=10 s and leaves at t=20 s. With consistent
+                # hashing about 1/5 of the flows hash to it; only the
+                # connection table keeps them on their original real.
+                run_conncheck "$RUN/cc.json" 30 \
+                    10 "real_add $label lb1 $added" \
+                    20 "real_del $label lb1 $added"
+                append exp3_churn.jsonl --merge "$RUN/cc.json" experiment=exp3 "${LF[@]}" scenario=add \
+                    "added_real=$added" "added_backend_id:=5" "min_fraction_moved:=0.2" \
+                    "events=real add $added at t=10s, real del at t=20s, end t=30s" \
+                    "repeat:=$rep" "notes=$NOTES"
+            fi
             sleep 2
         done
+    done
     done
     all_lbs_off
 }
